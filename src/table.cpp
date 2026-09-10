@@ -129,11 +129,6 @@ void table_t::start(connection_params_t const &connection_params,
 
         //create the table
         m_db_connection->exec(sql);
-
-        if (m_srid != "4326") {
-            create_geom_check_trigger(*m_db_connection, m_target->schema(),
-                                      m_target->name(), "ST_IsValid(NEW.way)");
-        }
     }
 
     prepare();
@@ -172,6 +167,10 @@ void table_t::generate_copy_column_list()
     joiner.add("way");
 
     m_target->set_rows(joiner());
+
+    if (m_srid != "4326") {
+        m_target->set_conditions("ST_IsValid(way)");
+    }
 }
 
 void table_t::stop(bool updateable, bool enable_hstore_index,
@@ -185,11 +184,6 @@ void table_t::stop(bool updateable, bool enable_hstore_index,
         qualified_name(m_target->schema(), m_target->name() + "_tmp");
 
     if (!m_append) {
-        if (m_srid != "4326") {
-            drop_geom_check_trigger(*m_db_connection, m_target->schema(),
-                                    m_target->name());
-        }
-
         log_info("Clustering table '{}' by geometry...", m_target->name());
 
         std::string const sql =
@@ -217,11 +211,6 @@ void table_t::stop(bool updateable, bool enable_hstore_index,
             m_db_connection->exec("CREATE INDEX ON {} USING BTREE (osm_id) {}",
                                   qual_name,
                                   tablespace_clause(table_space_index));
-            if (m_srid != "4326") {
-                create_geom_check_trigger(*m_db_connection, m_target->schema(),
-                                          m_target->name(),
-                                          "ST_IsValid(NEW.way)");
-            }
         }
 
         /* Create hstore index if selected */

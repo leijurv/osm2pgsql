@@ -34,9 +34,9 @@ class db_target_descr_t
 {
 public:
     db_target_descr_t(std::string schema, std::string name, std::string id,
-                      std::string rows = {})
+                      std::string rows = {}, std::string conditions = {})
     : m_schema(std::move(schema)), m_name(std::move(name)), m_id(std::move(id)),
-      m_rows(std::move(rows))
+      m_rows(std::move(rows)), m_conditions(std::move(conditions))
     {
         assert(!m_schema.empty());
         assert(!m_name.empty());
@@ -46,8 +46,14 @@ public:
     std::string const &name() const noexcept { return m_name; }
     std::string const &id() const noexcept { return m_id; }
     std::string const &rows() const noexcept { return m_rows; }
+    std::string const &conditions() const noexcept { return m_conditions; }
 
     void set_rows(std::string rows) { m_rows = std::move(rows); }
+
+    void set_conditions(std::string conditions)
+    {
+        m_conditions = std::move(conditions);
+    }
 
     /**
      * Check if the buffer would use exactly the same copy operation.
@@ -68,6 +74,8 @@ private:
     std::string m_id;
     /// Comma-separated list of rows for copy operation (when empty: all rows)
     std::string m_rows;
+    /// Conditions for the COPY command.
+    std::string m_conditions;
 };
 
 /**

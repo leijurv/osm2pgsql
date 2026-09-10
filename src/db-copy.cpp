@@ -220,6 +220,11 @@ void db_copy_thread_t::thread_t::start_copy(
                        target->rows());
     }
 
+    if (!target->conditions().empty()) {
+        fmt::format_to(std::back_inserter(sql), FMT_STRING(" WHERE {}"),
+                       target->conditions());
+    }
+
     sql.push_back('\0');
     m_db_connection.copy_start(to_string(sql));
 

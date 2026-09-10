@@ -37,13 +37,4 @@ TEST_CASE("config with schema should work")
             conn.get_count("pg_catalog.pg_tables", "schemaname = 'myschema'"));
 
     REQUIRE(7103 == conn.get_count("myschema.osm2pgsql_test_line"));
-
-    REQUIRE(1 ==
-            conn.get_count("pg_catalog.pg_proc",
-                           "proname = 'osm2pgsql_test_line_osm2pgsql_valid'"));
-
-    REQUIRE(1 == conn.get_count("pg_catalog.pg_trigger"));
-    REQUIRE(1 ==
-            conn.get_count("pg_catalog.pg_trigger",
-                           "tgname = 'osm2pgsql_test_line_osm2pgsql_valid'"));
 }

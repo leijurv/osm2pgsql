@@ -222,6 +222,27 @@ std::string flex_table_t::build_sql_column_list() const
     return joiner();
 }
 
+std::string flex_table_t::build_sql_copy_condition() const
+{
+    assert(!m_columns.empty());
+
+    std::string checks;
+
+    for (auto const &column : m_columns) {
+        if (column.is_geometry_column() && column.needs_isvalid()) {
+            checks.append(fmt::format(
+                R"(("{0}" IS NULL OR ST_IsValid("{0}")) AND )", column.name()));
+        }
+    }
+
+    if (!checks.empty()) {
+        // remove last " AND "
+        checks.resize(checks.size() - 5);
+    }
+
+    return checks;
+}
+
 std::string flex_table_t::build_sql_create_id_index() const
 {
     if (m_primary_key_index) {
@@ -269,30 +290,6 @@ bool flex_table_t::with_id_cache() const noexcept { return m_with_id_cache; }
 
 namespace {
 
-void enable_check_trigger(pg_conn_t const &db_connection,
-                          flex_table_t const &table)
-{
-    std::string checks;
-
-    for (auto const &column : table.columns()) {
-        if (column.is_geometry_column() && column.needs_isvalid()) {
-            checks.append(fmt::format(
-                R"((NEW."{0}" IS NULL OR ST_IsValid(NEW."{0}")) AND )",
-                column.name()));
-        }
-    }
-
-    if (checks.empty()) {
-        return;
-    }
-
-    // remove last " AND "
-    checks.resize(checks.size() - 5);
-
-    create_geom_check_trigger(db_connection, table.schema(), table.name(),
-                              checks);
-}
-
 } // anonymous namespace
 
 void table_connection_t::start(pg_conn_t const &db_connection,
@@ -311,8 +308,6 @@ void table_connection_t::start(pg_conn_t const &db_connection,
             table().cluster_by_geom() ? flex_table_t::table_type::interim
                                       : flex_table_t::table_type::permanent,
             table().full_name()));
-
-        enable_check_trigger(db_connection, table());
     }
 
     table().prepare(db_connection);
@@ -328,11 +323,6 @@ void table_connection_t::stop(pg_conn_t const &db_connection, bool updateable,
     }
 
     if (table().cluster_by_geom()) {
-        if (table().geom_column().needs_isvalid()) {
-            drop_geom_check_trigger(db_connection, table().schema(),
-                                    table().name());
-        }
-
         log_info("Clustering table '{}' by geometry...", table().name());
 
         db_connection.exec(table().build_sql_create_table(
@@ -354,10 +344,6 @@ void table_connection_t::stop(pg_conn_t const &db_connection, bool updateable,
         db_connection.exec(R"(ALTER TABLE {} RENAME TO "{}")",
                            table().full_tmp_name(), table().name());
         m_id_index_created = false;
-
-        if (updateable) {
-            enable_check_trigger(db_connection, table());
-        }
     }
 
     if (table().indexes().empty()) {

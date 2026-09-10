@@ -1409,6 +1409,7 @@ void output_flex_t::init_lua(std::string const &filename,
     setup_lua_environment(lua_state(), filename, get_options()->append);
 
     luaX_add_table_int(lua_state(), "stage", 1);
+    luaX_add_table_str(lua_state(), "proj_version", get_proj_version());
 
     lua_pushliteral(lua_state(), "properties");
     lua_createtable(lua_state(), 0, (int)properties.size());

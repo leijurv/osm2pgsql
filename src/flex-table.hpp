@@ -157,6 +157,8 @@ public:
 
     std::string build_sql_column_list() const;
 
+    std::string build_sql_copy_condition() const;
+
     std::string build_sql_create_id_index() const;
 
     /// Does this table take objects of the specified type?
@@ -288,7 +290,7 @@ public:
     : m_proj(reprojection_t::create_projection(table->srid())), m_table(table),
       m_target(std::make_shared<db_target_descr_t>(
           table->schema(), table->name(), table->id_column_names(),
-          table->build_sql_column_list())),
+          table->build_sql_column_list(), table->build_sql_copy_condition())),
       m_copy_mgr(copy_thread)
     {
     }
