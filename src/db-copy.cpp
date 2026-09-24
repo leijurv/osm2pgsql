@@ -234,9 +234,9 @@ void db_copy_thread_t::thread_t::start_copy(
 
     if (target->binary()) {
         // Signature, flags (none), length of header extension (none)
-        static constexpr std::string_view header{
+        static constexpr std::string_view HEADER{
             "PGCOPY\n\xff\r\n\0\0\0\0\0\0\0\0\0", 19};
-        m_db_connection.copy_send(header, target->name());
+        m_db_connection.copy_send(HEADER, target->name());
     }
 
     m_inflight = target;
@@ -247,8 +247,8 @@ void db_copy_thread_t::thread_t::finish_copy()
     if (m_inflight) {
         if (m_inflight->binary()) {
             // File trailer: a row with field count -1
-            static constexpr std::string_view trailer{"\xff\xff", 2};
-            m_db_connection.copy_send(trailer, m_inflight->name());
+            static constexpr std::string_view TRAILER{"\xff\xff", 2};
+            m_db_connection.copy_send(TRAILER, m_inflight->name());
         }
         m_db_connection.copy_end(m_inflight->name());
         m_inflight.reset();

@@ -449,13 +449,11 @@ private:
     void put_be(T value)
     {
         using U = std::make_unsigned_t<T>;
-        auto v = static_cast<U>(value);
-        char bytes[sizeof(T)];
+        auto const v = static_cast<std::uint64_t>(static_cast<U>(value));
         for (std::size_t i = sizeof(T); i > 0; --i) {
-            bytes[i - 1] = static_cast<char>(v & 0xffU);
-            v >>= 8U;
+            m_current.buffer +=
+                static_cast<char>((v >> (8U * (i - 1))) & 0xffU);
         }
-        m_current.buffer.append(bytes, sizeof(T));
     }
 
     template <typename T>
@@ -522,10 +520,10 @@ private:
             throw std::runtime_error{"Invalid timestamp (0)."};
         }
         // Microseconds since 2000-01-01 00:00:00 UTC
-        constexpr int64_t pg_epoch = 946684800;
+        constexpr int64_t PG_EPOCH = 946684800;
         put_be(static_cast<int32_t>(sizeof(int64_t)));
         put_be(
-            (static_cast<int64_t>(timestamp.seconds_since_epoch()) - pg_epoch) *
+            (static_cast<int64_t>(timestamp.seconds_since_epoch()) - PG_EPOCH) *
             1000000);
     }
 

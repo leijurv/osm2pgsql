@@ -99,7 +99,7 @@ void check_row(std::vector<std::string> const &row)
  */
 template <typename FUNC>
 void check_text_and_binary(std::string const &sql_type, copy_field_type type,
-                           FUNC &&write)
+                           FUNC const &write)
 {
     auto const conn = db.connect();
     conn.exec("DROP TABLE IF EXISTS test_copy_text, test_copy_binary");
