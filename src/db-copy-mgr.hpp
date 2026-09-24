@@ -432,6 +432,19 @@ private:
                         static_cast<int>(type));
     }
 
+    /// Is the integer value representable in the (signed) type R?
+    template <typename R, typename T>
+    static constexpr bool fits_in(T value) noexcept
+    {
+        if constexpr (std::is_signed_v<T>) {
+            return value >= std::numeric_limits<R>::min() &&
+                   value <= std::numeric_limits<R>::max();
+        } else {
+            return static_cast<std::uintmax_t>(value) <=
+                   static_cast<std::uintmax_t>(std::numeric_limits<R>::max());
+        }
+    }
+
     template <typename T>
     void put_be(T value)
     {
@@ -560,14 +573,12 @@ private:
         if constexpr (std::is_integral_v<T>) {
             switch (type) {
             case copy_field_type::int2:
-                assert(value >= std::numeric_limits<int16_t>::min() &&
-                       value <= std::numeric_limits<int16_t>::max());
+                assert(fits_in<int16_t>(value));
                 put_be(static_cast<int32_t>(sizeof(int16_t)));
                 put_be(static_cast<int16_t>(value));
                 return;
             case copy_field_type::int4:
-                assert(value >= std::numeric_limits<int32_t>::min() &&
-                       value <= std::numeric_limits<int32_t>::max());
+                assert(fits_in<int32_t>(value));
                 put_be(static_cast<int32_t>(sizeof(int32_t)));
                 put_be(static_cast<int32_t>(value));
                 return;
