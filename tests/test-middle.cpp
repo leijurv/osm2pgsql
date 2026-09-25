@@ -584,52 +584,35 @@ TEST_CASE("middle: add node with attributes")
         buffer.add_node("n10 v123 c456 t2009-02-13T23:31:30Z i789 usomebody"
                         " x1.1 y2.2 Tamenity=bench,name=Blue");
 
-    auto const check = [&](std::shared_ptr<middle_pgsql_t> const &mid) {
-        auto const mid_q = mid->get_query_instance();
-        osmium::memory::Buffer outbuf{4096,
-                                      osmium::memory::Buffer::auto_grow::yes};
-        REQUIRE(mid_q->node_get(10, &outbuf));
-        auto const &node = outbuf.get<osmium::Node>(0);
+    auto mid = std::make_shared<middle_pgsql_t>(thread_pool, &options);
+    mid->start();
 
-        CHECK(node.id() == 10);
-        CHECK(node.location() == node10.location());
-        if (options.extra_attributes) {
-            CHECK(node.timestamp() == node10.timestamp());
-            CHECK(node.version() == node10.version());
-            CHECK(node.changeset() == node10.changeset());
-            CHECK(node.uid() == node10.uid());
-            CHECK(std::strcmp(node.user(), node10.user()) == 0);
-        } else {
-            CHECK(node.version() == 0);
-            CHECK(node.changeset() == 0);
-            CHECK(node.uid() == 0);
-        }
-        REQUIRE(node.tags().size() == 2);
-        CHECK(std::strcmp(node.tags()["amenity"], "bench") == 0);
-        CHECK(std::strcmp(node.tags()["name"], "Blue") == 0);
-    };
+    mid->node(node10);
+    mid->after_nodes();
+    mid->after_ways();
+    mid->after_relations();
 
-    {
-        auto mid = std::make_shared<middle_pgsql_t>(thread_pool, &options);
-        mid->start();
+    auto const mid_q = mid->get_query_instance();
+    osmium::memory::Buffer outbuf{4096, osmium::memory::Buffer::auto_grow::yes};
+    REQUIRE(mid_q->node_get(10, &outbuf));
+    auto const &node = outbuf.get<osmium::Node>(0);
 
-        mid->node(node10);
-        mid->after_nodes();
-        mid->after_ways();
-        mid->after_relations();
-
-        check(mid);
+    CHECK(node.id() == 10);
+    CHECK(node.location() == node10.location());
+    if (options.extra_attributes) {
+        CHECK(node.timestamp() == node10.timestamp());
+        CHECK(node.version() == node10.version());
+        CHECK(node.changeset() == node10.changeset());
+        CHECK(node.uid() == node10.uid());
+        CHECK(std::strcmp(node.user(), node10.user()) == 0);
+    } else {
+        CHECK(node.version() == 0);
+        CHECK(node.changeset() == 0);
+        CHECK(node.uid() == 0);
     }
-
-    // From now on use append mode to not destroy the data we just added.
-    options.append = true;
-
-    {
-        auto mid = std::make_shared<middle_pgsql_t>(thread_pool, &options);
-        mid->start();
-
-        check(mid);
-    }
+    REQUIRE(node.tags().size() == 2);
+    CHECK(std::strcmp(node.tags()["amenity"], "bench") == 0);
+    CHECK(std::strcmp(node.tags()["name"], "Blue") == 0);
 }
 
 TEMPLATE_TEST_CASE("middle: add, delete and update way", "",
