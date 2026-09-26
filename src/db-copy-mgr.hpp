@@ -10,6 +10,7 @@
  * For a full list of authors see the git log.
  */
 
+#include <array>
 #include <cassert>
 #include <cmath>
 #include <cstdint>
@@ -21,6 +22,7 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <utility>
 
 #include <osmium/osm/timestamp.hpp>
 
@@ -156,7 +158,7 @@ public:
     {
         if (m_binary_types) {
             next_field();
-            put_be(static_cast<int32_t>(-1));
+            put_int32(-1); // NULL
             return;
         }
         m_current.buffer += "\\N\t";
@@ -174,11 +176,11 @@ public:
         if (m_binary_types) {
             check_field_type(next_field(), copy_field_type::int8_array);
             m_field_start = start_field_length();
-            put_be(static_cast<int32_t>(1));        // number of dimensions
-            put_be(static_cast<int32_t>(0));        // no NULL elements
-            put_be(static_cast<uint32_t>(INT8OID)); // element type
-            put_be(static_cast<int32_t>(0)); // length, set in finish_array()
-            put_be(static_cast<int32_t>(1)); // lower bound
+            put_int32(1);       // number of dimensions
+            put_int32(0);       // no NULL elements
+            put_int32(INT8OID); // element type
+            put_int32(0);       // length, set in finish_array()
+            put_int32(1);       // lower bound
             return;
         }
         m_current.buffer += "{";
@@ -193,8 +195,7 @@ public:
     void add_array_elem(osmid_t value)
     {
         if (m_binary_types) {
-            put_be(static_cast<int32_t>(sizeof(int64_t)));
-            put_be(static_cast<int64_t>(value));
+            put_value(value);
             return;
         }
         add_value(value);
@@ -217,9 +218,9 @@ public:
             if (elements == 0) {
                 // An empty array has zero dimensions and no dimension info.
                 m_current.buffer.resize(header + 12);
-                put_be_at(header, static_cast<int32_t>(0));
+                put_length_at(header, 0); // number of dimensions
             } else {
-                put_be_at(header + 12, static_cast<int32_t>(elements));
+                put_length_at(header + 12, elements);
             }
             finish_field_length(m_field_start);
             return;
@@ -249,7 +250,7 @@ public:
         if (m_binary_types) {
             check_field_type(next_field(), copy_field_type::hstore);
             m_field_start = start_field_length();
-            put_be(static_cast<int32_t>(0)); // pairs, set in finish_hash()
+            put_int32(0); // pairs, set in finish_hash()
             m_hash_pairs = 0;
         }
     }
@@ -330,7 +331,7 @@ public:
     void finish_hash()
     {
         if (m_binary_types) {
-            put_be_at(m_field_start + 4, m_hash_pairs);
+            put_length_at(m_field_start + 4, m_hash_pairs);
             finish_field_length(m_field_start);
             return;
         }
@@ -396,7 +397,7 @@ public:
 
 private:
     /// OID of the int8 type, needed for the elements of int8[].
-    static constexpr uint32_t INT8OID = 20;
+    static constexpr int32_t INT8OID = 20;
     /// Array header: ndim, flags, element type, one dimension, lower bound
     static constexpr std::size_t ARRAY_HEADER_SIZE = 20;
     /// Array element: length and int8 value
@@ -413,7 +414,7 @@ private:
         assert(m_binary_types);
         assert(m_field < m_binary_types->size());
         if (m_field == 0) {
-            put_be(static_cast<int16_t>(m_binary_types->size()));
+            put_int16(static_cast<int16_t>(m_binary_types->size()));
         }
         return (*m_binary_types)[m_field++];
     }
@@ -445,26 +446,58 @@ private:
         }
     }
 
-    template <typename T>
-    void put_be(T value)
+    /**
+     * The bytes of an integer in big-endian (network) byte order, which is
+     * what the binary format uses. Compilers turn this into a single byte
+     * swap instruction.
+     */
+    template <typename T, std::size_t... I>
+    static constexpr std::array<char, sizeof(T)>
+    big_endian_bytes(T value, std::index_sequence<I...> /*bytes*/) noexcept
     {
-        using U = std::make_unsigned_t<T>;
-        auto const v = static_cast<std::uint64_t>(static_cast<U>(value));
-        for (std::size_t i = sizeof(T); i > 0; --i) {
-            m_current.buffer +=
-                static_cast<char>((v >> (8U * (i - 1))) & 0xffU);
-        }
+        auto const v =
+            static_cast<uint64_t>(static_cast<std::make_unsigned_t<T>>(value));
+        return {static_cast<char>(v >> (8U * (sizeof(T) - 1 - I)))...};
     }
 
     template <typename T>
-    void put_be_at(std::size_t pos, T value)
+    static constexpr std::array<char, sizeof(T)>
+    big_endian_bytes(T value) noexcept
     {
-        using U = std::make_unsigned_t<T>;
-        auto v = static_cast<U>(value);
-        for (std::size_t i = sizeof(T); i > 0; --i) {
-            m_current.buffer[pos + i - 1] = static_cast<char>(v & 0xffU);
-            v >>= 8U;
-        }
+        return big_endian_bytes(value, std::make_index_sequence<sizeof(T)>{});
+    }
+
+    template <typename T>
+    void put_be(T value)
+    {
+        auto const bytes = big_endian_bytes(value);
+        m_current.buffer.append(bytes.data(), bytes.size());
+    }
+
+    void put_int16(int16_t value) { put_be(value); }
+    void put_int32(int32_t value) { put_be(value); }
+
+    /// Write the length of a field or the number of elements of something.
+    void put_length(std::size_t length)
+    {
+        assert(length <= std::numeric_limits<int32_t>::max());
+        put_int32(static_cast<int32_t>(length));
+    }
+
+    /// Overwrite an int32 written earlier at position pos.
+    void put_length_at(std::size_t pos, std::size_t length)
+    {
+        assert(length <= std::numeric_limits<int32_t>::max());
+        auto const bytes = big_endian_bytes(static_cast<int32_t>(length));
+        m_current.buffer.replace(pos, bytes.size(), bytes.data(), bytes.size());
+    }
+
+    /// Write a complete field with a fixed-size value: length, then value.
+    template <typename T>
+    void put_value(T value)
+    {
+        put_length(sizeof(T));
+        put_be(value);
     }
 
     /// Reserve space for the length of a field, return its position.
@@ -477,12 +510,12 @@ private:
 
     void finish_field_length(std::size_t pos)
     {
-        put_be_at(pos, static_cast<int32_t>(m_current.buffer.size() - pos - 4));
+        put_length_at(pos, m_current.buffer.size() - pos - 4);
     }
 
     void add_binary_bytes(std::string_view data)
     {
-        put_be(static_cast<int32_t>(data.size()));
+        put_length(data.size());
         m_current.buffer += data;
     }
 
@@ -493,7 +526,7 @@ private:
             add_binary_bytes(str);
             break;
         case copy_field_type::jsonb:
-            put_be(static_cast<int32_t>(str.size() + 1));
+            put_length(str.size() + 1);
             m_current.buffer += '\1'; // jsonb format version
             m_current.buffer += str;
             break;
@@ -521,8 +554,7 @@ private:
         }
         // Microseconds since 2000-01-01 00:00:00 UTC
         constexpr int64_t PG_EPOCH = 946684800;
-        put_be(static_cast<int32_t>(sizeof(int64_t)));
-        put_be(
+        put_value(
             (static_cast<int64_t>(timestamp.seconds_since_epoch()) - PG_EPOCH) *
             1000000);
     }
@@ -539,15 +571,14 @@ private:
 
         switch (type) {
         case copy_field_type::boolean:
-            put_be(static_cast<int32_t>(1));
+            put_length(1);
             m_current.buffer += (value != 0) ? '\1' : '\0';
             return;
         case copy_field_type::float4: {
             float const f = copy_to_float4(static_cast<double>(value));
             uint32_t bits = 0;
             std::memcpy(&bits, &f, sizeof(bits));
-            put_be(static_cast<int32_t>(sizeof(bits)));
-            put_be(bits);
+            put_value(bits);
             return;
         }
         case copy_field_type::float8: {
@@ -557,8 +588,7 @@ private:
             }
             uint64_t bits = 0;
             std::memcpy(&bits, &d, sizeof(bits));
-            put_be(static_cast<int32_t>(sizeof(bits)));
-            put_be(bits);
+            put_value(bits);
             return;
         }
         case copy_field_type::text:
@@ -572,17 +602,14 @@ private:
             switch (type) {
             case copy_field_type::int2:
                 assert(fits_in<int16_t>(value));
-                put_be(static_cast<int32_t>(sizeof(int16_t)));
-                put_be(static_cast<int16_t>(value));
+                put_value(static_cast<int16_t>(value));
                 return;
             case copy_field_type::int4:
                 assert(fits_in<int32_t>(value));
-                put_be(static_cast<int32_t>(sizeof(int32_t)));
-                put_be(static_cast<int32_t>(value));
+                put_value(static_cast<int32_t>(value));
                 return;
             case copy_field_type::int8:
-                put_be(static_cast<int32_t>(sizeof(int64_t)));
-                put_be(static_cast<int64_t>(value));
+                put_value(static_cast<int64_t>(value));
                 return;
             default:
                 break;
@@ -676,7 +703,7 @@ private:
     /// Start of the array or hash field being written (binary format).
     std::size_t m_field_start = 0;
     /// Number of pairs in the hash field being written (binary format).
-    int32_t m_hash_pairs = 0;
+    std::size_t m_hash_pairs = 0;
 };
 
 #endif // OSM2PGSQL_DB_COPY_MGR_HPP
