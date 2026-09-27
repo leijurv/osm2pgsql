@@ -25,7 +25,9 @@
 #include <lua.hpp>
 
 #include <cstdint>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -106,6 +108,14 @@ public:
                   std::shared_ptr<middle_query_t> mid,
                   std::shared_ptr<db_copy_thread_t> copy_thread);
 
+    struct worker_tag
+    {};
+
+    /// Constructor for parallel workers with their own Lua state
+    output_flex_t(output_flex_t const *other,
+                  std::shared_ptr<middle_query_t> mid,
+                  std::shared_ptr<db_copy_thread_t> copy_thread, worker_tag);
+
     output_flex_t(output_flex_t const &) = delete;
     output_flex_t &operator=(output_flex_t const &) = delete;
 
@@ -117,6 +127,10 @@ public:
     std::shared_ptr<output_t>
     clone(std::shared_ptr<middle_query_t> const &mid,
           std::shared_ptr<db_copy_thread_t> const &copy_thread) const override;
+
+    std::shared_ptr<output_t> clone_worker(
+        std::shared_ptr<middle_query_t> const &mid,
+        std::shared_ptr<db_copy_thread_t> const &copy_thread) const override;
 
     void start() override;
     void stop() override;
@@ -161,6 +175,7 @@ public:
 
     int app_define_locator();
     int app_define_table();
+    int worker_define_table();
     int app_define_expire_output();
     int app_get_bbox();
 
@@ -197,7 +212,8 @@ private:
 
     void process_relation();
 
-    void init_lua(std::string const &filename, properties_t const &properties);
+    void init_lua(std::string const &filename,
+                  std::map<std::string, std::string> const &properties);
 
     void check_context_and_state(char const *name, char const *context,
                                  bool condition);
@@ -311,8 +327,20 @@ private:
     std::shared_ptr<db_copy_thread_t> m_copy_thread;
 
     // This is shared between all clones of the output and must only be
-    // accessed while protected using the lua_mutex.
+    // accessed while protected using the lua_mutex. Workers created with
+    // clone_worker() have their own Lua state and their own mutex.
     std::shared_ptr<lua_State> m_lua_state;
+    std::shared_ptr<std::mutex> m_lua_mutex = std::make_shared<std::mutex>();
+
+    // Properties as seen by the Lua code, kept so workers can set up the
+    // same environment in their own Lua state.
+    std::shared_ptr<std::map<std::string, std::string>> m_lua_properties =
+        std::make_shared<std::map<std::string, std::string>>();
+
+    // In a worker the style is loaded a second time; its define_table()
+    // calls then refer to the tables the main output already set up.
+    bool m_worker = false;
+    std::size_t m_worker_table_count = 0;
 
     // Caches for old and new geometries from a single OSM object
     geometry_cache_t m_geometry_cache;

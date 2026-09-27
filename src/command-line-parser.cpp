@@ -559,6 +559,25 @@ options_t parse_command_line(int argc, char *argv[])
         ->description("Disable concurrent index creation.")
         ->group("Advanced options");
 
+    // --bulk-threads
+    app.add_option("--bulk-threads", options.bulk_threads)
+        ->transform(CLI::Bound(1, 32))
+        ->description("Import without random access to node locations "
+                      "(sort-merge join through bucket files) and process "
+                      "nodes and ways with NUM parallel Lua states. Only for "
+                      "--create with a single sorted input file and the flex "
+                      "output; the style must not keep state across objects.")
+        ->type_name("NUM")
+        ->group("Advanced options");
+
+    // --bulk-tmpdir
+    app.add_option("--bulk-tmpdir", options.bulk_tmpdir)
+        ->description("Directory for bulk import bucket files (default: "
+                      "current directory). Needs about 20 bytes per way node "
+                      "reference at peak, ~260 GB for the planet.")
+        ->type_name("DIR")
+        ->group("Advanced options");
+
     // --number-processes
     app.add_option("--number-processes", options.num_procs)
         // The threads will open up database connections which will
@@ -674,6 +693,25 @@ options_t parse_command_line(int argc, char *argv[])
     }
 
     check_options_expire(&options);
+
+    if (options.bulk_threads > 0) {
+        if (options.append) {
+            throw std::runtime_error{
+                "--bulk-threads only works with --create."};
+        }
+        if (options.output_backend != "flex") {
+            throw std::runtime_error{
+                "--bulk-threads only works with the flex output."};
+        }
+        if (options.input_files.size() != 1) {
+            throw std::runtime_error{
+                "--bulk-threads needs exactly one input file."};
+        }
+        if (options.bbox.valid()) {
+            throw std::runtime_error{
+                "--bulk-threads can not be used with --bbox."};
+        }
+    }
 
     options.connection_params = app.connection_params();
 

@@ -34,6 +34,7 @@ target_sources(osm2pgsql_lib PRIVATE
     geom.cpp
     hex.cpp
     idlist.cpp
+    bulk-import.cpp
     input.cpp
     locator.cpp
     logging.cpp

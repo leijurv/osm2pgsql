@@ -18,6 +18,7 @@
 #include <cassert>
 #include <cstdint>
 #include <cstdlib>
+#include <future>
 #include <initializer_list>
 #include <iterator>
 #include <memory>
@@ -893,6 +894,78 @@ void middle_pgsql_t::relation_set(osmium::Relation const &rel)
     m_db_copy.finish_line();
 }
 
+namespace {
+
+/**
+ * Writes ways into the middle ways table through a COPY connection of its
+ * own. Same row format as middle_pgsql_t::way_set() without attributes.
+ */
+class middle_pgsql_way_writer_t : public middle_way_writer_t
+{
+public:
+    middle_pgsql_way_writer_t(connection_params_t const &connection_params,
+                              std::shared_ptr<db_target_descr_t> target)
+    : m_copy_thread(std::make_shared<db_copy_thread_t>(connection_params)),
+      m_copy(m_copy_thread), m_target(std::move(target))
+    {}
+
+    void way(osmium::Way const &way) override
+    {
+        m_copy.new_line(m_target);
+        m_copy.add_column(way.id());
+
+        m_copy.new_array();
+        for (auto const &n : way.nodes()) {
+            m_copy.add_array_elem(n.ref());
+        }
+        m_copy.finish_array();
+
+        if (way.tags().empty()) {
+            m_copy.add_null_column();
+        } else {
+            json_writer_t writer;
+            tags_to_json(way.tags(), &writer);
+            m_copy.add_column(writer.json());
+        }
+
+        m_copy.finish_line();
+    }
+
+    void finish() override
+    {
+        m_copy.sync();
+        m_copy_thread->finish();
+    }
+
+private:
+    std::shared_ptr<db_copy_thread_t> m_copy_thread;
+    db_copy_mgr_t<db_deleter_by_id_t> m_copy;
+    std::shared_ptr<db_target_descr_t> m_target;
+};
+
+} // anonymous namespace
+
+std::unique_ptr<middle_way_writer_t> middle_pgsql_t::make_way_writer()
+{
+    // Attributes need the shared users map, so they are written by the
+    // middle itself.
+    if (m_store_options.with_attributes || m_options->append) {
+        return {};
+    }
+
+    // Many parallel writers appending to one btree all fight over its
+    // rightmost page, and building the index once afterwards is cheaper
+    // than maintaining it for every row. The table is still empty here.
+    if (!m_ways_pkey_deferred) {
+        dbexec(R"(ALTER TABLE {schema}"{prefix}_ways")"
+               R"( DROP CONSTRAINT "{prefix}_ways_pkey")");
+        m_ways_pkey_deferred = true;
+    }
+
+    return std::make_unique<middle_pgsql_way_writer_t>(
+        m_options->connection_params, m_tables.ways().copy_target());
+}
+
 bool middle_query_pgsql_t::relation_get(osmid_t id,
                                         osmium::memory::Buffer *buffer) const
 {
@@ -954,6 +1027,7 @@ void middle_pgsql_t::after_ways()
 #endif
 
     m_db_copy.sync();
+
     if (!m_options->append) {
         auto const &table = m_tables.ways();
         analyze_table(m_db_connection, table.schema(), table.name());
@@ -1123,12 +1197,29 @@ void middle_pgsql_t::build_way_node_index()
                         " USING GIN ({schema}\"{prefix}_index_bucket\"(nodes))"
                         " WITH (fastupdate = off) {index_tablespace}");
 
+    // The primary key was dropped for a bulk import (see make_way_writer()).
+    // Nothing needs it before the import is done, so it is added here, in
+    // parallel with the rest of the postprocessing.
+    std::string add_primary_key;
+    if (m_ways_pkey_deferred) {
+        add_primary_key = render_template(
+            R"(ALTER TABLE {schema}"{prefix}_ways" ADD PRIMARY KEY (id))");
+        m_ways_pkey_deferred = false;
+    }
+
     log_info("Building index on middle ways table");
-    m_tables.ways().task_set(thread_pool().submit([&, create_ways_index]() {
-        pg_conn_t const db_connection{m_options->connection_params,
-                                      "middle.index.ways"};
-        db_connection.exec(create_ways_index);
-    }));
+    m_tables.ways().task_set(
+        thread_pool().submit([&, create_ways_index, add_primary_key]() {
+            pg_conn_t const db_connection{m_options->connection_params,
+                                          "middle.index.ways"};
+            if (!add_primary_key.empty()) {
+                util::timer_t timer;
+                db_connection.exec(add_primary_key);
+                log_info("Added primary key on middle ways table in {}.",
+                         util::human_readable_duration(timer.stop()));
+            }
+            db_connection.exec(create_ways_index);
+        }));
 }
 
 void middle_pgsql_t::build_relation_member_indexes()

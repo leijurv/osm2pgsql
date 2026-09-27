@@ -155,6 +155,8 @@ struct middle_pgsql_t : public middle_t
 
     std::shared_ptr<middle_query_t> get_query_instance() override;
 
+    std::unique_ptr<middle_way_writer_t> make_way_writer() override;
+
     void set_requirements(output_requirements const &requirements) override;
 
 private:
@@ -191,6 +193,10 @@ private:
 
     // middle keeps its own thread for writing to the database.
     std::shared_ptr<db_copy_thread_t> m_copy_thread;
+
+    /// Ways table primary key was dropped for bulk loading, re-add it in
+    /// after_ways().
+    bool m_ways_pkey_deferred = false;
     db_copy_mgr_t<db_deleter_by_id_t> m_db_copy;
 
     /// Options for this middle.

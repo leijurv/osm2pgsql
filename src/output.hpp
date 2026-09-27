@@ -54,6 +54,20 @@ public:
           std::shared_ptr<db_copy_thread_t> const &copy_thread) const = 0;
 
     /**
+     * Like clone(), but the new output gets its own copy of any interpreter
+     * state (for flex: its own Lua state), so that several of these can
+     * process objects truly in parallel. Only valid for the passes of a bulk
+     * import and only for styles without cross-object state.
+     */
+    virtual std::shared_ptr<output_t> clone_worker(
+        std::shared_ptr<middle_query_t> const & /*mid*/,
+        std::shared_ptr<db_copy_thread_t> const & /*copy_thread*/) const
+    {
+        throw std::runtime_error{
+            "This output does not support parallel bulk processing."};
+    }
+
+    /**
      * Remove pointer to middle_query_t from output, so the middle_query_t
      * is properly cleaned up and doesn't hold references to any datastructures
      * any more.

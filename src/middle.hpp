@@ -12,6 +12,7 @@
 
 #include <osmium/memory/buffer.hpp>
 #include <osmium/osm/entity_bits.hpp>
+#include <osmium/osm/way.hpp>
 
 #include <cstdint>
 #include <memory>
@@ -102,6 +103,27 @@ struct middle_query_t : std::enable_shared_from_this<middle_query_t>
 };
 
 /**
+ * Writes ways into the middle from a thread of its own, in parallel with
+ * other writers. Used by bulk import.
+ */
+class middle_way_writer_t
+{
+public:
+    middle_way_writer_t() noexcept = default;
+    virtual ~middle_way_writer_t() = default;
+
+    middle_way_writer_t(middle_way_writer_t const &) = delete;
+    middle_way_writer_t &operator=(middle_way_writer_t const &) = delete;
+    middle_way_writer_t(middle_way_writer_t &&) = delete;
+    middle_way_writer_t &operator=(middle_way_writer_t &&) = delete;
+
+    virtual void way(osmium::Way const &way) = 0;
+
+    /// Wait until everything written is in the database.
+    virtual void finish() = 0;
+};
+
+/**
  * Interface for storing "raw" OSM data in an intermediate object store and
  * getting it back.
  */
@@ -172,6 +194,16 @@ public:
     }
 
     virtual std::shared_ptr<middle_query_t> get_query_instance() = 0;
+
+    /**
+     * For bulk import: a writer that can store ways in parallel with other
+     * writers, or nullptr if this middle can't do that (then use way()).
+     * Must be called before the first way is written.
+     */
+    virtual std::unique_ptr<middle_way_writer_t> make_way_writer()
+    {
+        return {};
+    }
 
     virtual void set_requirements(output_requirements const &) {}
 

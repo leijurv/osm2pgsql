@@ -107,6 +107,12 @@ struct options_t
 
     unsigned int num_procs = 1;
 
+    /// Number of worker threads for bulk import (0 = no bulk import)
+    unsigned int bulk_threads = 0;
+
+    /// Directory for the bucket files of bulk import
+    std::string bulk_tmpdir{"."};
+
     /**
      * Middle database format:
      * 0 = non-slim mode, no database middle (ram middle)

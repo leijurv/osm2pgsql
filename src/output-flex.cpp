@@ -37,6 +37,8 @@
 #include "util.hpp"
 #include "wkb.hpp"
 
+#include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cstdlib>
 #include <cstring>
@@ -49,9 +51,6 @@
 #include <string_view>
 
 namespace {
-
-// Mutex used to coordinate access to Lua code
-std::mutex lua_mutex;
 
 // Lua can't call functions on C++ objects directly. This macro defines simple
 // C "trampoline" functions which are called from Lua which get the current
@@ -240,7 +239,7 @@ typename CONTAINER::value_type &get_from_idx_param(lua_State *lua_state,
 std::size_t get_nodes(middle_query_t const &middle, osmium::Way *way)
 {
     constexpr std::size_t MAX_MISSING_NODES = 100;
-    static std::size_t count_missing_nodes = 0;
+    static std::atomic<std::size_t> count_missing_nodes = 0;
 
     auto const count = middle.nodes_get_list(&way->nodes());
 
@@ -613,6 +612,11 @@ int output_flex_t::app_define_locator()
             " main Lua code, not in any of the callbacks."};
     }
 
+    if (m_worker) {
+        throw std::runtime_error{
+            "Locators are not supported with --bulk-threads."};
+    }
+
     return setup_flex_locator(lua_state(), m_locators.get());
 }
 
@@ -622,6 +626,10 @@ int output_flex_t::app_define_table()
         throw std::runtime_error{
             "Database tables have to be defined in the"
             " main Lua code, not in any of the callbacks."};
+    }
+
+    if (m_worker) {
+        return worker_define_table();
     }
 
     return setup_flex_table(lua_state(), m_tables.get(), m_expire_outputs.get(),
@@ -636,6 +644,11 @@ int output_flex_t::app_define_expire_output()
         throw std::runtime_error{
             "Expire outputs have to be defined in the"
             " main Lua code, not in any of the callbacks."};
+    }
+
+    if (m_worker) {
+        throw std::runtime_error{
+            "Expire outputs are not supported with --bulk-threads."};
     }
 
     return setup_flex_expire_output(lua_state(), get_options()->dbschema,
@@ -911,14 +924,14 @@ void output_flex_t::call_lua_function(prepared_lua_function_t func,
 void output_flex_t::get_mutex_and_call_lua_function(
     prepared_lua_function_t func)
 {
-    std::lock_guard<std::mutex> const guard{lua_mutex};
+    std::lock_guard<std::mutex> const guard{*m_lua_mutex};
     call_lua_function(func);
 }
 
 void output_flex_t::get_mutex_and_call_lua_function(
     prepared_lua_function_t func, osmium::OSMObject const &object)
 {
-    std::lock_guard<std::mutex> const guard{lua_mutex};
+    std::lock_guard<std::mutex> const guard{*m_lua_mutex};
     call_lua_function(func, object);
 }
 
@@ -949,7 +962,7 @@ void output_flex_t::select_relation_members()
 
     // We can not use get_mutex_and_call_lua_function() here, because we need
     // the mutex to stick around as long as we are looking at the Lua stack.
-    std::lock_guard<std::mutex> const guard{lua_mutex};
+    std::lock_guard<std::mutex> const guard{*m_lua_mutex};
     call_lua_function(m_select_relation_members, m_relation_cache.get());
 
     // If the function returned nil there is nothing to be marked.
@@ -1305,6 +1318,7 @@ output_flex_t::output_flex_t(output_flex_t const *other,
   m_db_connection(get_options()->connection_params, "out.flex.thread"),
   m_stage2_way_ids(other->m_stage2_way_ids),
   m_copy_thread(std::move(copy_thread)), m_lua_state(other->m_lua_state),
+  m_lua_mutex(other->m_lua_mutex), m_lua_properties(other->m_lua_properties),
   m_area_buffer(1024, osmium::memory::Buffer::auto_grow::yes),
   m_process_node(other->m_process_node), m_process_way(other->m_process_way),
   m_process_relation(other->m_process_relation),
@@ -1338,6 +1352,74 @@ output_flex_t::clone(std::shared_ptr<middle_query_t> const &mid,
     return std::make_shared<output_flex_t>(this, mid, copy_thread);
 }
 
+output_flex_t::output_flex_t(output_flex_t const *other,
+                             std::shared_ptr<middle_query_t> mid,
+                             std::shared_ptr<db_copy_thread_t> copy_thread,
+                             worker_tag /*unused*/)
+: output_flex_t(other, std::move(mid), std::move(copy_thread))
+{
+    if (other->m_select_relation_members) {
+        throw std::runtime_error{"Two-stage processing (select_relation_"
+                                 "members) is not supported with "
+                                 "--bulk-threads."};
+    }
+
+    // Load the style again into a Lua state of our own. Its define_table()
+    // calls resolve to the tables already set up by the main output, so
+    // everything outside Lua stays shared.
+    m_worker = true;
+    m_lua_mutex = std::make_shared<std::mutex>();
+    init_lua(get_options()->style, *m_lua_properties);
+
+    if (m_worker_table_count != m_tables->size()) {
+        throw fmt_error("Style defined {} tables when loaded for a worker, "
+                        "but {} for the main output; --bulk-threads needs "
+                        "a style that defines the same tables every time.",
+                        m_worker_table_count, m_tables->size());
+    }
+}
+
+std::shared_ptr<output_t> output_flex_t::clone_worker(
+    std::shared_ptr<middle_query_t> const &mid,
+    std::shared_ptr<db_copy_thread_t> const &copy_thread) const
+{
+    return std::make_shared<output_flex_t>(this, mid, copy_thread,
+                                           worker_tag{});
+}
+
+int output_flex_t::worker_define_table()
+{
+    if (lua_type(lua_state(), 1) != LUA_TTABLE) {
+        throw std::runtime_error{
+            "Argument #1 to 'define_table' must be a table."};
+    }
+    lua_getfield(lua_state(), 1, "name");
+    char const *const name = lua_tostring(lua_state(), -1);
+    std::string const table_name = name ? name : "";
+    lua_pop(lua_state(), 1);
+
+    // Match by name, not by position: styles commonly define their tables
+    // while iterating a Lua hash table with pairs(), and the iteration order
+    // differs between Lua states.
+    auto const it = std::find_if(
+        m_tables->cbegin(), m_tables->cend(),
+        [&](flex_table_t const &t) { return t.name() == table_name; });
+    if (it == m_tables->cend()) {
+        throw fmt_error("Style defined table '{}' when loaded for a worker, "
+                        "but not for the main output.",
+                        table_name);
+    }
+    auto const idx = static_cast<std::size_t>(it - m_tables->cbegin());
+    ++m_worker_table_count;
+
+    lua_settop(lua_state(), 0);
+    void *ptr = lua_newuserdata(lua_state(), sizeof(std::size_t));
+    new (ptr) std::size_t{idx};
+    luaL_getmetatable(lua_state(), OSM2PGSQL_TABLE_CLASS);
+    lua_setmetatable(lua_state(), -2);
+    return 1;
+}
+
 output_flex_t::output_flex_t(std::shared_ptr<middle_query_t> const &mid,
                              std::shared_ptr<thread_pool_t> thread_pool,
                              options_t const &options,
@@ -1347,7 +1429,8 @@ output_flex_t::output_flex_t(std::shared_ptr<middle_query_t> const &mid,
   m_copy_thread(std::make_shared<db_copy_thread_t>(options.connection_params)),
   m_area_buffer(1024, osmium::memory::Buffer::auto_grow::yes)
 {
-    init_lua(options.style, properties);
+    m_lua_properties->insert(properties.begin(), properties.end());
+    init_lua(options.style, *m_lua_properties);
 
     // If the osm2pgsql.select_relation_members() Lua function is defined
     // it means we need two-stage processing which in turn means we need
@@ -1400,8 +1483,9 @@ output_flex_t::output_flex_t(std::shared_ptr<middle_query_t> const &mid,
     create_expire_tables(*m_expire_outputs, get_options()->connection_params);
 }
 
-void output_flex_t::init_lua(std::string const &filename,
-                             properties_t const &properties)
+void output_flex_t::init_lua(
+    std::string const &filename,
+    std::map<std::string, std::string> const &properties)
 {
     m_lua_state.reset(luaL_newstate(),
                       [](lua_State *state) { lua_close(state); });

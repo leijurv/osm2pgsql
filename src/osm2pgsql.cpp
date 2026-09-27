@@ -7,6 +7,7 @@
  * For a full list of authors see the git log.
  */
 
+#include "bulk-import.hpp"
 #include "command-line-parser.hpp"
 #include "input.hpp"
 #include "logging.hpp"
@@ -14,8 +15,8 @@
 #include "options.hpp"
 #include "osmdata.hpp"
 #include "output.hpp"
-#include "pgsql.hpp"
 #include "pgsql-capabilities.hpp"
+#include "pgsql.hpp"
 #include "properties.hpp"
 #include "util.hpp"
 #include "version.hpp"
@@ -70,8 +71,11 @@ file_info run(options_t const &options, properties_t *properties)
 
     // Processing: In this phase the input file(s) are read and parsed,
     // populating some of the tables.
-    auto finfo = process_files(files, &osmdata, options.append,
-                               get_logger().show_progress());
+    auto finfo =
+        options.bulk_threads > 0
+            ? bulk_import(files.front(), middle, output, options, &osmdata)
+            : process_files(files, &osmdata, options.append,
+                            get_logger().show_progress());
 
     show_memory_usage();
 
