@@ -51,6 +51,7 @@ option(EXTERNAL_LIBOSMIUM "Do not use the bundled libosmium" OFF)
 option(EXTERNAL_PROTOZERO "Do not use the bundled protozero" OFF)
 option(EXTERNAL_FMT       "Do not use the bundled fmt"       OFF)
 option(EXTERNAL_CLI11     "Do not use the bundled CLI11"     OFF)
+option(EXTERNAL_LMDB      "Do not use the bundled LMDB"      OFF)
 
 if (NOT WIN32 AND NOT APPLE)
     # No need for this path, just a workaround to make cmake work on all systems.
@@ -209,7 +210,23 @@ find_package(OpenCV QUIET OPTIONAL_COMPONENTS core imgcodecs imgproc)
 
 ############### Libraries are found now ########################
 
-set(LIBS ${Boost_LIBRARIES} ${PostgreSQL_LIBRARY} ${OSMIUM_LIBRARIES})
+if (EXTERNAL_LMDB)
+    find_path(LMDB_INCLUDE_DIR lmdb.h)
+    find_library(LMDB_LIBRARY NAMES lmdb)
+    if (NOT LMDB_INCLUDE_DIR OR NOT LMDB_LIBRARY)
+        message(FATAL_ERROR "LMDB library not found")
+    endif()
+else()
+    set(LMDB_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/contrib/lmdb")
+    add_library(lmdb STATIC contrib/lmdb/mdb.c contrib/lmdb/midl.c)
+    target_compile_options(lmdb PRIVATE -w)
+    target_link_libraries(lmdb Threads::Threads)
+    set(LMDB_LIBRARY lmdb)
+endif()
+include_directories(SYSTEM ${LMDB_INCLUDE_DIR})
+
+set(LIBS ${Boost_LIBRARIES} ${PostgreSQL_LIBRARY} ${OSMIUM_LIBRARIES}
+    ${LMDB_LIBRARY})
 
 if (WITH_PROJ)
     find_path(PROJ6_INCLUDE_DIR proj.h)
