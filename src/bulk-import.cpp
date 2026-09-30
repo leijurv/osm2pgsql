@@ -63,9 +63,9 @@
 #include <osmium/osm/relation.hpp>
 #include <osmium/osm/way.hpp>
 
+#ifdef __linux__
 #include <fcntl.h>
-#include <sys/stat.h>
-#include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -73,9 +73,11 @@
 #include <cerrno>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <deque>
 #include <exception>
+#include <filesystem>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -167,16 +169,19 @@ std::string bucket_path(std::string const &dir, char const *kind, unsigned b)
     return fmt::format("{}/osm2pgsql-bulk-{}-{:04}.bin", dir, kind, b);
 }
 
-void write_all(int fd, char const *data, std::size_t size)
+void write_all(std::FILE *file, char const *data, std::size_t size)
 {
-    while (size > 0) {
-        auto const written = ::write(fd, data, size);
-        if (written < 0) {
-            throw std::system_error{errno, std::system_category(),
-                                    "Writing bucket file failed"};
-        }
-        data += written;
-        size -= static_cast<std::size_t>(written);
+    if (size > 0 && std::fwrite(data, 1, size, file) != size) {
+        throw std::system_error{errno, std::system_category(),
+                                "Writing bucket file failed"};
+    }
+}
+
+void close_file(std::FILE *file)
+{
+    if (std::fclose(file) != 0) {
+        throw std::system_error{errno, std::system_category(),
+                                "Closing bucket file failed"};
     }
 }
 
@@ -197,8 +202,8 @@ public:
     ~bucket_writer_t() noexcept
     {
         for (auto &b : m_buckets) {
-            if (b.fd >= 0) {
-                ::close(b.fd);
+            if (b.file) {
+                std::fclose(b.file); // NOLINT(cert-err33-c)
             }
         }
     }
@@ -212,10 +217,10 @@ public:
             m_buckets.resize(bucket + 1);
         }
         auto &b = m_buckets[bucket];
-        if (b.fd < 0) {
+        if (!b.file) {
             auto const path = bucket_path(m_dir, m_kind, bucket);
-            b.fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-            if (b.fd < 0) {
+            b.file = std::fopen(path.c_str(), "wb");
+            if (!b.file) {
                 throw std::system_error{
                     errno, std::system_category(),
                     fmt::format("Creating bucket file '{}' failed", path)};
@@ -223,10 +228,10 @@ public:
             b.buffer.resize(m_buffer_size);
         }
         if (b.used + size > m_buffer_size) {
-            write_all(b.fd, b.buffer.data(), b.used);
+            write_all(b.file, b.buffer.data(), b.used);
             b.used = 0;
             if (size > m_buffer_size) {
-                write_all(b.fd, static_cast<char const *>(record), size);
+                write_all(b.file, static_cast<char const *>(record), size);
                 m_bytes += size;
                 return;
             }
@@ -240,10 +245,11 @@ public:
     unsigned close()
     {
         for (auto &b : m_buckets) {
-            if (b.fd >= 0) {
-                write_all(b.fd, b.buffer.data(), b.used);
-                ::close(b.fd);
-                b.fd = -1;
+            if (b.file) {
+                write_all(b.file, b.buffer.data(), b.used);
+                auto *const file = b.file;
+                b.file = nullptr;
+                close_file(file);
                 b.buffer = {};
             }
         }
@@ -255,7 +261,7 @@ public:
 private:
     struct bucket_t
     {
-        int fd = -1;
+        std::FILE *file = nullptr;
         std::vector<char> buffer;
         std::size_t used = 0;
     };
@@ -272,28 +278,23 @@ template <typename T>
 std::vector<T> take_bucket(std::string const &path)
 {
     std::vector<T> records;
-    int const fd = ::open(path.c_str(), O_RDONLY);
-    if (fd < 0) {
+    std::FILE *const file = std::fopen(path.c_str(), "rb");
+    if (!file) {
         return records;
     }
-    struct stat st
-    {};
-    ::fstat(fd, &st);
-    records.resize(static_cast<std::size_t>(st.st_size) / sizeof(T));
-    ::posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
-    auto *data = reinterpret_cast<char *>(records.data());
-    std::size_t left = records.size() * sizeof(T);
-    while (left > 0) {
-        auto const got = ::read(fd, data, left);
-        if (got <= 0) {
-            ::close(fd);
-            throw fmt_error("Reading bucket file '{}' failed.", path);
-        }
-        data += got;
-        left -= static_cast<std::size_t>(got);
+    std::error_code ec;
+    auto const size = std::filesystem::file_size(path, ec);
+    records.resize(ec ? 0 : static_cast<std::size_t>(size) / sizeof(T));
+#ifdef POSIX_FADV_SEQUENTIAL
+    ::posix_fadvise(fileno(file), 0, 0, POSIX_FADV_SEQUENTIAL);
+#endif
+    auto const bytes = records.size() * sizeof(T);
+    bool const ok = std::fread(records.data(), 1, bytes, file) == bytes && !ec;
+    std::fclose(file); // NOLINT(cert-err33-c)
+    if (!ok) {
+        throw fmt_error("Reading bucket file '{}' failed.", path);
     }
-    ::close(fd);
-    ::unlink(path.c_str());
+    std::filesystem::remove(path);
     return records;
 }
 
@@ -555,6 +556,30 @@ public:
                 mid->get_query_instance());
             m_workers.push_back({output->clone_worker(midq, copy_thread),
                                  copy_thread, midq, nullptr});
+        }
+    }
+
+    worker_pool_t(worker_pool_t const &) = delete;
+    worker_pool_t &operator=(worker_pool_t const &) = delete;
+    worker_pool_t(worker_pool_t &&) = delete;
+    worker_pool_t &operator=(worker_pool_t &&) = delete;
+
+    /**
+     * If finish() wasn't called (because of an exception), the workers are
+     * stopped without doing the remaining jobs. They must be joined before
+     * the members they wait on are destroyed.
+     */
+    ~worker_pool_t() noexcept
+    {
+        {
+            std::lock_guard<std::mutex> const guard{m_mutex};
+            m_queue.clear();
+            m_done = true;
+        }
+        m_not_empty.notify_all();
+        m_not_full.notify_all();
+        for (auto &thread : m_threads) {
+            thread.join();
         }
     }
 
@@ -913,11 +938,12 @@ unsigned resolve_node_refs(osmium::io::File const &file, std::string const &dir,
                     member_t header;
                     int32_t x;
                     int32_t y;
-                } __attribute__((packed))
-                const rec{{static_cast<uint32_t>(m.rel_id & REL_MASK),
-                           NODE_MEMBER, id},
-                          loc.x(),
-                          loc.y()};
+                } const rec{{static_cast<uint32_t>(m.rel_id & REL_MASK),
+                             NODE_MEMBER, id},
+                            loc.x(),
+                            loc.y()};
+                static_assert(sizeof(rec) == sizeof(member_t) + 8,
+                              "no padding in the record");
                 members->add(m.rel_id >> REL_SHIFT, &rec, sizeof(rec));
                 ++members_resolved;
             }

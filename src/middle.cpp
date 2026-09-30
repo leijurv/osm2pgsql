@@ -7,6 +7,9 @@
  * For a full list of authors see the git log.
  */
 
+#ifdef HAVE_CODA
+#include "middle-coda.hpp"
+#endif
 #include "middle-pgsql.hpp"
 #include "middle-ram.hpp"
 #include "middle.hpp"
@@ -20,6 +23,13 @@ std::shared_ptr<middle_t>
 create_middle(std::shared_ptr<thread_pool_t> thread_pool,
               options_t const &options)
 {
+#ifdef HAVE_CODA
+    if (!options.coda_dir.empty()) {
+        return std::make_shared<middle_coda_t>(std::move(thread_pool),
+                                               &options);
+    }
+#endif
+
     if (options.slim) {
         return std::make_shared<middle_pgsql_t>(std::move(thread_pool),
                                                 &options);

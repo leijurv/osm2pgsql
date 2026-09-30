@@ -107,6 +107,9 @@ struct options_t
 
     unsigned int num_procs = 1;
 
+    /// Directory of the CODA middle (empty = no CODA middle)
+    std::string coda_dir;
+
     /// Number of worker threads for bulk import (0 = no bulk import)
     unsigned int bulk_threads = 0;
 

@@ -63,6 +63,31 @@ private:
     std::string m_filename;
 };
 
+/// RAII structure to remove a directory and everything in it.
+class dir_t
+{
+public:
+    explicit dir_t(std::string dirname) : m_dirname(std::move(dirname))
+    {
+        std::filesystem::remove_all(m_dirname);
+    }
+
+    dir_t(dir_t const &) = delete;
+    dir_t &operator=(dir_t const &) = delete;
+
+    dir_t(dir_t &&) = delete;
+    dir_t &operator=(dir_t const &&) = delete;
+
+    ~dir_t() noexcept
+    {
+        std::error_code ec;
+        std::filesystem::remove_all(m_dirname, ec);
+    }
+
+private:
+    std::string m_dirname;
+};
+
 } // namespace testing::cleanup
 
 #endif // OSM2PGSQL_TESTS_COMMON_CLEANUP_HPP

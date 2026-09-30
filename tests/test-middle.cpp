@@ -84,6 +84,16 @@ struct options_flat_node_cache
     }
 };
 
+struct options_coda
+{
+    static options_t options(testing::pg::tempdb_t const &tmpdb)
+    {
+        options_t o = testing::opt_t().slim(tmpdb);
+        o.coda_dir = "test_middle_coda";
+        return o;
+    }
+};
+
 struct options_ram_optimized
 {
     static options_t options(testing::pg::tempdb_t const &)
@@ -92,12 +102,20 @@ struct options_ram_optimized
     }
 };
 
+#ifdef HAVE_CODA
+#define OPTIONS_CODA options_coda,
+#else
+#define OPTIONS_CODA
+#endif
+
 TEMPLATE_TEST_CASE("middle import", "", options_slim_default,
                    options_slim_with_lc_prefix, options_slim_with_uc_prefix,
-                   options_slim_with_schema, options_ram_optimized)
+                   options_slim_with_schema, OPTIONS_CODA
+                   options_ram_optimized)
 {
     options_t const options = TestType::options(db);
     testing::cleanup::file_t const flatnode_cleaner{options.flat_node_file};
+    testing::cleanup::dir_t const coda_cleaner{options.coda_dir};
 
     auto conn = db.connect();
     auto const num_tables =

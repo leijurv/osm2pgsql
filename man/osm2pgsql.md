@@ -167,6 +167,19 @@ mandatory for short options too.
     file will stay on disk after import, use \--drop to remove it (but you
     can't do updates then).
 
+\--middle-coda=DIR
+:   Keep the middle in a compact "CODA" database in directory DIR instead of
+    in PostgreSQL. Ways are stored with the locations of their nodes, so no
+    flat node file is needed; the full planet needs about 81GB. Implies
+    \--slim. On import the middle is built from the (single, sorted) input
+    file first, without random access and with \--number-processes
+    threads, and then the objects are read back from it and processed by the
+    output (with \--bulk-threads in parallel).
+    If no input file is given, an existing CODA middle is used, so an output
+    can be created (again) without the input file. Updates with \--append use
+    the directory stored in the database. Object attributes (-x) are not
+    supported, untagged nodes are only available as locations of ways.
+
 \--middle-schema=SCHEMA
 :   Use PostgreSQL schema SCHEMA for all tables, indexes, and functions in the
     middle. The schema must exist in the database and be writable by the

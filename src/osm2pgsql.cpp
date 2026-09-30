@@ -11,6 +11,9 @@
 #include "command-line-parser.hpp"
 #include "input.hpp"
 #include "logging.hpp"
+#ifdef HAVE_CODA
+#include "middle-coda.hpp"
+#endif
 #include "middle.hpp"
 #include "options.hpp"
 #include "osmdata.hpp"
@@ -71,11 +74,17 @@ file_info run(options_t const &options, properties_t *properties)
 
     // Processing: In this phase the input file(s) are read and parsed,
     // populating some of the tables.
-    auto finfo =
-        options.bulk_threads > 0
-            ? bulk_import(files.front(), middle, output, options, &osmdata)
-            : process_files(files, &osmdata, options.append,
-                            get_logger().show_progress());
+    file_info finfo;
+    if (!options.coda_dir.empty() && !options.append) {
+#ifdef HAVE_CODA
+        finfo = coda_import(files, middle, output, &osmdata);
+#endif
+    } else if (options.bulk_threads > 0) {
+        finfo = bulk_import(files.front(), middle, output, options, &osmdata);
+    } else {
+        finfo = process_files(files, &osmdata, options.append,
+                              get_logger().show_progress());
+    }
 
     show_memory_usage();
 
@@ -114,6 +123,13 @@ void set_up_properties(properties_t *properties, options_t const &options)
             "flat_node_file", std::filesystem::absolute(
                                   std::filesystem::path{options.flat_node_file})
                                   .string());
+    }
+
+    if (!options.coda_dir.empty()) {
+        properties->set_string(
+            "coda_dir",
+            std::filesystem::absolute(std::filesystem::path{options.coda_dir})
+                .string());
     }
 
     properties->set_string("prefix", options.prefix);
@@ -216,6 +232,37 @@ void check_and_update_flat_node_file(properties_t *properties,
     }
 }
 
+void check_and_update_coda_dir(properties_t *properties, options_t *options)
+{
+    auto const coda_dir_from_import = properties->get_string("coda_dir", "");
+    if (coda_dir_from_import.empty()) {
+        if (!options->coda_dir.empty()) {
+            throw std::runtime_error{
+                "Database was imported without CODA middle. Can not use "
+                "--middle-coda now."};
+        }
+        return;
+    }
+
+    options->slim = true;
+    if (options->coda_dir.empty()) {
+        options->coda_dir = coda_dir_from_import;
+        log_info("Using CODA middle in '{}' (same as on import).",
+                 coda_dir_from_import);
+        return;
+    }
+
+    auto const absolute_path =
+        std::filesystem::absolute(std::filesystem::path{options->coda_dir})
+            .string();
+    if (absolute_path != coda_dir_from_import) {
+        log_info("Using the CODA middle you specified on the command line "
+                 "('{}') instead of the one used on import ('{}').",
+                 absolute_path, coda_dir_from_import);
+        properties->set_string("coda_dir", absolute_path);
+    }
+}
+
 void check_prefix(properties_t const &properties, options_t *options)
 {
     auto const prefix = properties.get_string("prefix", "planet_osm");
@@ -306,6 +353,7 @@ void check_and_update_properties(properties_t *properties, options_t *options)
     check_updatable(*properties);
     check_attributes(*properties, options);
     check_and_update_flat_node_file(properties, options);
+    check_and_update_coda_dir(properties, options);
     check_prefix(*properties, options);
     check_db_format(*properties, options);
     check_output(*properties, options);

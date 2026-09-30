@@ -73,6 +73,31 @@ target_sources(osm2pgsql_lib PRIVATE
     ${PROJECT_BINARY_DIR}/src/version.cpp
 )
 
+if (HAVE_CODA)
+    # The tag dictionary of the CODA middle is compiled in.
+    function(embed_file VAR FILE)
+        file(READ "${FILE}" _hex HEX)
+        string(REGEX REPLACE "(..)" "0x\\1," _bytes "${_hex}")
+        set(${VAR} "${_bytes}" PARENT_SCOPE)
+    endfunction()
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+                    "${CMAKE_CURRENT_SOURCE_DIR}/coda-dict/tags-v1.txt"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/coda-dict/tags-v1.zdict")
+    embed_file(CODA_DICT_ENTRIES "${CMAKE_CURRENT_SOURCE_DIR}/coda-dict/tags-v1.txt")
+    embed_file(CODA_DICT_ZSTD "${CMAKE_CURRENT_SOURCE_DIR}/coda-dict/tags-v1.zdict")
+    configure_file(coda-dict.cpp.in coda-dict.cpp @ONLY)
+
+    target_sources(osm2pgsql_lib PRIVATE
+        coda-build.cpp
+        coda-format.cpp
+        coda-members.cpp
+        coda-source.cpp
+        coda-store.cpp
+        middle-coda.cpp
+        ${CMAKE_CURRENT_BINARY_DIR}/coda-dict.cpp
+    )
+endif()
+
 if (HAVE_PROJ6)
     target_sources(osm2pgsql_lib PRIVATE reprojection-generic-proj6.cpp)
 else()

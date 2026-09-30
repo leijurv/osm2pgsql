@@ -143,6 +143,24 @@ void check_options_non_slim(CLI::App const &app)
     }
 }
 
+void check_options_coda(CLI::App const &app, options_t *options)
+{
+#ifndef HAVE_CODA
+    throw std::runtime_error{
+        "osm2pgsql was built without support for the CODA middle."};
+#endif
+    for (auto const *opt :
+         {"--flat-nodes", "--extra-attributes", "--bbox", "--cache",
+          "--middle-schema", "--middle-with-nodes", "--tablespace-slim-data",
+          "--tablespace-slim-index"}) {
+        if (app.count(opt) > 0) {
+            throw fmt_error("Option {} can not be used with --middle-coda.",
+                            app.get_option(opt)->get_name(false, true));
+        }
+    }
+    options->slim = true;
+}
+
 void check_options_output_flex(CLI::App const &app)
 {
     auto const bad_options = app.get_options([](CLI::Option const *option) {
@@ -159,14 +177,17 @@ void check_options_output_flex(CLI::App const &app)
     }
 }
 
-void check_options_output_null(CLI::App const &app)
+void check_options_output_null(CLI::App const &app, options_t const &options)
 {
-    auto const bad_options = app.get_options([](CLI::Option const *option) {
+    // With the CODA middle the number of processes is also used for
+    // building the middle.
+    bool const coda = !options.coda_dir.empty();
+    auto const bad_options = app.get_options([&](CLI::Option const *option) {
         return option->get_group() == "Pgsql output options" ||
                option->get_group() == "Expire options" ||
                option->get_name() == "--style" ||
                option->get_name() == "--disable-parallel-indexing" ||
-               option->get_name() == "--number-processes";
+               (option->get_name() == "--number-processes" && !coda);
     });
 
     for (auto const *opt : bad_options) {
@@ -515,6 +536,15 @@ options_t parse_command_line(int argc, char *argv[])
         ->type_name("FILE")
         ->group("Middle options");
 
+    // --middle-coda
+    app.add_option("--middle-coda", options.coda_dir)
+        ->description("Keep the middle in a compact CODA database in "
+                      "directory DIR instead of in PostgreSQL (implies "
+                      "--slim). Without input file, create the output from "
+                      "an existing CODA middle.")
+        ->type_name("DIR")
+        ->group("Middle options");
+
     // --middle-schema
     app.add_option("--middle-schema", options.middle_dbschema)
         ->description(
@@ -643,6 +673,10 @@ options_t parse_command_line(int argc, char *argv[])
                                  "used at the same time!"};
     }
 
+    if (!options.coda_dir.empty()) {
+        check_options_coda(app, &options);
+    }
+
     check_options(&options);
 
     if (options.slim) { // slim mode, use database middle
@@ -654,7 +688,7 @@ options_t parse_command_line(int argc, char *argv[])
     if (options.output_backend == "flex") {
         check_options_output_flex(app);
     } else if (options.output_backend == "null") {
-        check_options_output_null(app);
+        check_options_output_null(app, options);
     } else if (options.output_backend == "pgsql" ||
                options.output_backend.empty()) {
         check_options_output_pgsql(app, &options);
@@ -682,7 +716,8 @@ options_t parse_command_line(int argc, char *argv[])
                          "--output-pgsql-schema parameter");
     }
 
-    if (options.input_files.empty()) {
+    if (options.input_files.empty() &&
+        (options.coda_dir.empty() || options.append)) {
         throw std::runtime_error{
             "Missing input file(s). Try 'osm2pgsql --help'."};
     }
@@ -703,7 +738,7 @@ options_t parse_command_line(int argc, char *argv[])
             throw std::runtime_error{
                 "--bulk-threads only works with the flex output."};
         }
-        if (options.input_files.size() != 1) {
+        if (options.input_files.size() != 1 && options.coda_dir.empty()) {
             throw std::runtime_error{
                 "--bulk-threads needs exactly one input file."};
         }

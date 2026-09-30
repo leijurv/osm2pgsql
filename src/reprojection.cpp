@@ -12,6 +12,12 @@
 #include "format.hpp"
 #include "reprojection.hpp"
 
+#include <algorithm>
+#include <iterator>
+#include <memory>
+#include <mutex>
+#include <vector>
+
 namespace {
 
 geom::point_t lonlat2merc(geom::point_t point)
@@ -90,14 +96,27 @@ std::shared_ptr<reprojection_t> reprojection_t::create_projection(int srs)
 reprojection_t const &get_projection(int srs)
 {
     // In almost all cases there will be only one or two projections used, so
-    // storing them in a vector and doing linear search is totally fine.
-    static std::vector<std::shared_ptr<reprojection_t>> projections;
-
-    for (auto const &p : projections) {
+    // storing them in a vector and doing linear search is totally fine. This
+    // is called from several threads (with --bulk-threads), so the list is
+    // protected by a mutex and each thread keeps its own list of pointers.
+    thread_local std::vector<reprojection_t const *> cache;
+    for (auto const *p : cache) {
         if (p->target_srs() == srs) {
             return *p;
         }
     }
 
-    return *projections.emplace_back(reprojection_t::create_projection(srs));
+    static std::mutex mutex;
+    static std::vector<std::shared_ptr<reprojection_t>> projections;
+
+    std::lock_guard<std::mutex> const guard{mutex};
+    auto it =
+        std::find_if(projections.begin(), projections.end(),
+                     [&](auto const &p) { return p->target_srs() == srs; });
+    if (it == projections.end()) {
+        projections.push_back(reprojection_t::create_projection(srs));
+        it = std::prev(projections.end());
+    }
+    cache.push_back(it->get());
+    return **it;
 }
