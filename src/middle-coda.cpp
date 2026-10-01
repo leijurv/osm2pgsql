@@ -30,8 +30,12 @@
 #include <atomic>
 #include <cassert>
 #include <chrono>
+#include <cstdlib>
+#include <exception>
 #include <filesystem>
+#include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <thread>
@@ -188,29 +192,46 @@ public:
     {
     }
 
-    /// The (member, parent) pairs of the block with member.
+    /**
+     * The (member, parent) pairs of the block with member. Only the last
+     * block is kept (decoded blocks are large), so look up members in order.
+     */
     pairs_t const &block_of(id_type member)
     {
         auto const key = member >> index_shift(m_db);
-        auto it = m_blocks.find(key);
-        if (it == m_blocks.end()) {
-            pairs_t pairs;
+        if (!m_valid || key != m_key) {
+            m_pairs.clear();
             auto const value = m_txn->get(m_db, key);
             if (value.has_value()) {
-                pairs = decode_pairs(value.value(), key << index_shift(m_db),
-                                     *m_dict);
+                m_pairs = decode_pairs(value.value(),
+                                       key << index_shift(m_db), *m_dict);
             }
-            it = m_blocks.emplace(key, std::move(pairs)).first;
+            m_key = key;
+            m_valid = true;
         }
-        return it->second;
+        return m_pairs;
     }
 
 private:
     txn_t const *m_txn;
     tag_dict_t const *m_dict;
     db_t m_db;
-    std::unordered_map<id_type, pairs_t> m_blocks;
+    pairs_t m_pairs;
+    id_type m_key = 0;
+    bool m_valid = false;
 };
+
+/// The ids sorted (so that index blocks are visited in order).
+std::vector<id_type> sorted_ids(idlist_t const &list)
+{
+    std::vector<id_type> ids;
+    ids.reserve(list.size());
+    for (auto const id : list) {
+        ids.push_back(static_cast<id_type>(id));
+    }
+    std::sort(ids.begin(), ids.end());
+    return ids;
+}
 
 // ---------------------------------------------------------------- queries
 
@@ -525,7 +546,8 @@ void prefetch(store_t const &store, std::vector<std::pair<db_t, id_type>> keys,
 class updater_t
 {
 public:
-    updater_t(txn_t *txn, tag_dict_t const &dict) : m_txn(txn), m_dict(&dict)
+    updater_t(txn_t *txn, tag_dict_t const &dict, unsigned threads)
+    : m_txn(txn), m_dict(&dict), m_threads(std::max(threads, 1U))
     {
     }
 
@@ -590,18 +612,26 @@ public:
         }
     }
 
+    /// Parents of a member (sorted).
     std::vector<id_type> parents(db_t db, id_type member)
     {
         std::vector<id_type> result;
         auto &b = index_block(db, member);
-        if (b.modified) {
-            for (auto it = b.set.lower_bound({member, 0});
-                 it != b.set.end() && it->first == member; ++it) {
+        for_parents(b.pairs, member, [&](id_type parent) {
+            if (b.removed.empty() || !b.removed.count({member, parent})) {
+                result.push_back(parent);
+            }
+        });
+        auto it = b.added.lower_bound({member, 0});
+        if (it != b.added.end() && it->first == member) {
+            auto const stored = result.size();
+            for (; it != b.added.end() && it->first == member; ++it) {
                 result.push_back(it->second);
             }
-        } else {
-            for_parents(b.pairs, member,
-                        [&](id_type parent) { result.push_back(parent); });
+            std::inplace_merge(
+                result.begin(),
+                result.begin() + static_cast<std::ptrdiff_t>(stored),
+                result.end());
         }
         return result;
     }
@@ -609,25 +639,38 @@ public:
     bool has_parent(db_t db, id_type member)
     {
         auto &b = index_block(db, member);
-        if (b.modified) {
-            auto const it = b.set.lower_bound({member, 0});
-            return it != b.set.end() && it->first == member;
+        auto const it = b.added.lower_bound({member, 0});
+        if (it != b.added.end() && it->first == member) {
+            return true;
         }
-        auto const it = std::lower_bound(b.pairs.begin(), b.pairs.end(),
-                                         std::make_pair(member, id_type{0}));
-        return it != b.pairs.end() && it->first == member;
+        bool found = false;
+        for_parents(b.pairs, member, [&](id_type parent) {
+            found = found || !b.removed.count({member, parent});
+        });
+        return found;
     }
 
     void add_pair(db_t db, id_type member, id_type parent)
     {
-        auto &b = modify(index_block(db, member));
-        b.dirty |= b.set.emplace(member, parent).second;
+        auto &b = index_block(db, member);
+        std::pair<id_type, id_type> const pair{member, parent};
+        if (b.removed.erase(pair) > 0) {
+            b.dirty = true;
+        } else if (!std::binary_search(b.pairs.begin(), b.pairs.end(),
+                                       pair)) {
+            b.dirty |= b.added.insert(pair).second;
+        }
     }
 
     void del_pair(db_t db, id_type member, id_type parent)
     {
-        auto &b = modify(index_block(db, member));
-        b.dirty |= b.set.erase({member, parent}) > 0;
+        auto &b = index_block(db, member);
+        std::pair<id_type, id_type> const pair{member, parent};
+        if (b.added.erase(pair) > 0) {
+            b.dirty = true;
+        } else if (std::binary_search(b.pairs.begin(), b.pairs.end(), pair)) {
+            b.dirty |= b.removed.insert(pair).second;
+        }
     }
 
     /// Location of a node not in the changes: loose store or a parent way.
@@ -650,56 +693,140 @@ public:
         return std::nullopt;
     }
 
-    /// Write all changed blocks into the transaction.
+    /**
+     * Write all changed blocks into the transaction. The blocks are encoded
+     * in parallel, then written in key order (so the result doesn't depend
+     * on the number of threads).
+     */
     void flush()
     {
-        write(&m_ways, db_t::ways, [&](std::vector<way_t> const &objects) {
-            return encode_ways(objects, true, *m_dict);
-        });
-        write(&m_nodes, db_t::nodes, [&](std::vector<node_t> const &objects) {
-            return encode_nodes(objects, *m_dict);
-        });
-        write(&m_rels, db_t::rels, [&](std::vector<relation_t> const &objects) {
-            return encode_relations(objects, *m_dict);
-        });
+        std::vector<job_t> jobs;
+        auto const *dict = m_dict;
+        collect(m_ways, db_t::ways, &jobs,
+                [dict](std::vector<way_t> const &objects) {
+                    return encode_ways(objects, true, *dict);
+                });
+        collect(m_nodes, db_t::nodes, &jobs,
+                [dict](std::vector<node_t> const &objects) {
+                    return encode_nodes(objects, *dict);
+                });
+        collect(m_rels, db_t::rels, &jobs,
+                [dict](std::vector<relation_t> const &objects) {
+                    return encode_relations(objects, *dict);
+                });
         for (auto const db : {db_t::n2w, db_t::n2r, db_t::w2r, db_t::r2r}) {
             auto const shift = index_shift(db);
-            for (auto &[key, b] : m_index.at(static_cast<unsigned>(db))) {
+            for (auto const &[key, b] : m_index.at(static_cast<unsigned>(db))) {
                 if (!b.dirty) {
                     continue;
                 }
-                if (b.set.empty()) {
-                    m_txn->del(db, key);
-                } else {
-                    pairs_t const pairs(b.set.begin(), b.set.end());
-                    put(db, key, encode_pairs(pairs, key << shift, *m_dict));
+                if (b.pairs.size() == b.removed.size() && b.added.empty()) {
+                    jobs.emplace_back(db, key);
+                    continue;
                 }
+                auto const *entry = &b;
+                jobs.emplace_back(db, key,
+                                  [entry, base = key << shift, dict]() {
+                                      return encode_pairs(entry->current(),
+                                                          base, *dict);
+                                  });
             }
         }
+        run(&jobs);
     }
 
     std::uint64_t blocks_written() const noexcept { return m_written; }
     std::uint64_t bytes_written() const noexcept { return m_bytes; }
+
+    /// Estimated size of the changed blocks (at least a page each).
+    std::size_t dirty_bytes() const
+    {
+        constexpr std::size_t MIN_BLOCK = 4096;
+        std::size_t bytes = 0;
+        auto const add = [&](auto const &cache) {
+            for (auto const &[key, entry] : cache) {
+                if (entry.dirty) {
+                    bytes += std::max(entry.stored, MIN_BLOCK);
+                }
+            }
+        };
+        add(m_ways);
+        add(m_nodes);
+        add(m_rels);
+        for (auto const &cache : m_index) {
+            add(cache);
+        }
+        return bytes;
+    }
+
+    /// Continue in a new transaction after flush() and commit.
+    void restart(txn_t *txn)
+    {
+        m_txn = txn;
+        m_ways.clear();
+        m_nodes.clear();
+        m_rels.clear();
+        for (auto &cache : m_index) {
+            cache.clear();
+        }
+    }
 
 private:
     template <typename T>
     struct entry_t
     {
         std::vector<T> objects;
+        std::size_t stored = 0; ///< size of the block when it was read
         bool dirty = false;
+    };
+
+    /// A block to write: encode() gives the value, no encode() means delete.
+    struct job_t
+    {
+        job_t(db_t d, id_type k, std::function<std::string()> e = {})
+        : db(d), key(k), encode(std::move(e))
+        {
+        }
+
+        db_t db;
+        id_type key;
+        std::function<std::string()> encode;
+        std::string value;
     };
 
     template <typename T>
     using cache_t = std::map<id_type, entry_t<T>>;
 
-    /// An index block, switched from a sorted vector to a set on the first
-    /// change (inserting into large sorted vectors is quadratic on imports).
+    /**
+     * An index block: the stored pairs (sorted) and the changes to them,
+     * kept apart because inserting into large sorted vectors is quadratic
+     * on imports and copying whole blocks into sets is slow.
+     */
     struct index_entry_t
     {
         pairs_t pairs;
-        std::set<std::pair<id_type, id_type>> set;
-        bool modified = false;
+        std::set<std::pair<id_type, id_type>> added;   ///< not in pairs
+        std::set<std::pair<id_type, id_type>> removed; ///< in pairs
+        std::size_t stored = 0; ///< size of the block when it was read
         bool dirty = false;
+
+        /// The pairs with the changes applied (sorted).
+        pairs_t current() const
+        {
+            pairs_t result;
+            result.reserve(pairs.size() - removed.size() + added.size());
+            auto a = added.begin();
+            for (auto const &pair : pairs) {
+                for (; a != added.end() && *a < pair; ++a) {
+                    result.push_back(*a);
+                }
+                if (removed.empty() || !removed.count(pair)) {
+                    result.push_back(pair);
+                }
+            }
+            result.insert(result.end(), a, added.end());
+            return result;
+        }
     };
 
     template <typename T>
@@ -711,6 +838,7 @@ private:
         }
         auto &entry = (*cache)[key];
         if (auto const value = m_txn->get(db, key)) {
+            entry.stored = value->size();
             if constexpr (std::is_same_v<T, way_t>) {
                 entry.objects = decode_ways(*value, key, *m_dict);
             } else if constexpr (std::is_same_v<T, node_t>) {
@@ -733,20 +861,12 @@ private:
         }
         auto &entry = cache[key];
         if (auto const value = m_txn->get(db, key)) {
+            entry.stored = value->size();
             entry.pairs = decode_pairs(*value, key << shift, *m_dict);
         }
         return entry;
     }
 
-    static index_entry_t &modify(index_entry_t &b)
-    {
-        if (!b.modified) {
-            b.set.insert(b.pairs.begin(), b.pairs.end());
-            pairs_t{}.swap(b.pairs);
-            b.modified = true;
-        }
-        return b;
-    }
 
     void put(db_t db, id_type key, std::string const &value)
     {
@@ -756,22 +876,74 @@ private:
     }
 
     template <typename T, typename ENCODE>
-    void write(cache_t<T> *cache, db_t db, ENCODE const &encode)
+    static void collect(cache_t<T> const &cache, db_t db,
+                        std::vector<job_t> *jobs, ENCODE encode)
     {
-        for (auto const &[key, entry] : *cache) {
+        for (auto const &[key, entry] : cache) {
             if (!entry.dirty) {
                 continue;
             }
             if (entry.objects.empty()) {
-                m_txn->del(db, key);
-            } else {
-                put(db, key, encode(entry.objects));
+                jobs->emplace_back(db, key);
+                continue;
+            }
+            auto const *objects = &entry.objects;
+            jobs->emplace_back(
+                db, key, [objects, encode]() { return encode(*objects); });
+        }
+    }
+
+    /// Encode the jobs in batches with all threads, write them in order.
+    void run(std::vector<job_t> *jobs)
+    {
+        constexpr std::size_t BATCH = 4096;
+        for (std::size_t first = 0; first < jobs->size(); first += BATCH) {
+            std::size_t const last = std::min(first + BATCH, jobs->size());
+            std::atomic<std::size_t> next{first};
+            std::exception_ptr error;
+            std::mutex mutex;
+            auto const work = [&]() {
+                try {
+                    for (std::size_t i = next++; i < last; i = next++) {
+                        auto &job = (*jobs)[i];
+                        if (job.encode) {
+                            job.value = job.encode();
+                        }
+                    }
+                } catch (...) {
+                    std::lock_guard<std::mutex> const guard{mutex};
+                    error = std::current_exception();
+                    next = last;
+                }
+            };
+            unsigned const threads = static_cast<unsigned>(
+                std::min<std::size_t>(m_threads, last - first));
+            std::vector<std::thread> workers;
+            for (unsigned t = 1; t < threads; ++t) {
+                workers.emplace_back(work);
+            }
+            work();
+            for (auto &worker : workers) {
+                worker.join();
+            }
+            if (error) {
+                std::rethrow_exception(error);
+            }
+            for (std::size_t i = first; i < last; ++i) {
+                auto &job = (*jobs)[i];
+                if (job.encode) {
+                    put(job.db, job.key, job.value);
+                } else {
+                    m_txn->del(job.db, job.key);
+                }
+                std::string{}.swap(job.value);
             }
         }
     }
 
     txn_t *m_txn;
     tag_dict_t const *m_dict;
+    unsigned m_threads;
     cache_t<way_t> m_ways;
     cache_t<node_t> m_nodes;
     cache_t<relation_t> m_rels;
@@ -779,6 +951,45 @@ private:
     std::uint64_t m_written = 0;
     std::uint64_t m_bytes = 0;
 }; // class updater_t
+
+/**
+ * Limit for the changes written in one transaction. LMDB is copy-on-write:
+ * a transaction writes new copies of all pages it changes, and the pages it
+ * frees can only be reused by later transactions (the previous snapshot stays
+ * valid). So the database file grows by the size of the largest transaction
+ * and never shrinks. Committing whenever the changed blocks reach this size
+ * bounds that (and the memory used for them). Every object is applied
+ * completely (with its index changes and locations) within one transaction,
+ * so each commit leaves a consistent middle and applying the same changes
+ * again gives the same result.
+ */
+std::atomic<std::size_t> &txn_limit()
+{
+    constexpr std::size_t DEFAULT_LIMIT = 64UL * 1000UL * 1000UL;
+    static std::atomic<std::size_t> limit{DEFAULT_LIMIT};
+    return limit;
+}
+
+/// Commit if the changes so far are larger than txn_limit().
+void bound_txn(store_t const &store, std::unique_ptr<txn_t> *txn,
+               updater_t *updater, std::size_t *counter)
+{
+    constexpr std::size_t CHECK_EVERY = 256;
+    if (++*counter < CHECK_EVERY) {
+        return;
+    }
+    *counter = 0;
+    auto const bytes = updater->dirty_bytes();
+    if (bytes < txn_limit()) {
+        return;
+    }
+    log_debug("CODA middle: commit after {:.1f} MB of changes.",
+              static_cast<double>(bytes) / 1e6);
+    updater->flush();
+    (*txn)->commit();
+    *txn = std::make_unique<txn_t>(store, false);
+    updater->restart(txn->get());
+}
 
 /// The last version of every object of type T in the buffer.
 template <typename T>
@@ -887,27 +1098,30 @@ public:
     }
 
     /**
-     * Call func(output, key, value, buffer) for every block of db, blocks
-     * are handed out to the workers in small batches.
+     * Call func(output, key, value, buffer) for every block of db, small
+     * ranges of block keys are handed out to the workers. (Collecting the
+     * keys first would read all leaf pages in one thread, and as the leaf
+     * pages hold the block tails, they are spread over the whole database.)
      */
     template <typename FUNC>
     void run(store_t const &store, db_t db, FUNC const &func)
     {
-        constexpr std::size_t BATCH = 16;
-        std::vector<id_type> keys;
+        constexpr id_type RANGE = 16;
+        id_type end = 0;
         {
             txn_t const txn{store, true};
-            txn.for_each(db, [&](id_type key, std::string_view /*value*/) {
-                keys.push_back(key);
-            });
+            end = txn.end_key(db);
         }
         parallel(
-            keys.size(), BATCH,
+            static_cast<std::size_t>((end + RANGE - 1) / RANGE), 1,
             [&](worker_t &worker, txn_t const &txn,
                 osmium::memory::Buffer *buffer, std::size_t i) {
-                if (auto const value = txn.get(db, keys[i])) {
-                    func(worker.output.get(), keys[i], *value, buffer);
-                }
+                auto const first = static_cast<id_type>(i) * RANGE;
+                txn.for_each_in(db, first, first + RANGE - 1,
+                                [&](id_type key, std::string_view value) {
+                                    func(worker.output.get(), key, value,
+                                         buffer);
+                                });
             },
             store);
     }
@@ -1141,10 +1355,12 @@ void middle_coda_t::apply_nodes()
         prefetch(store(), std::move(way_keys));
     }
 
-    txn_t txn{store(), false};
-    updater_t u{&txn, store().dict()};
+    auto txn = std::make_unique<txn_t>(store(), false);
+    updater_t u{txn.get(), store().dict(), m_options->num_procs};
+    std::size_t since_check = 0;
     std::uint64_t moved = 0;
     for (auto const *node : nodes) {
+        bound_txn(store(), &txn, &u, &since_check);
         auto const id = static_cast<id_type>(node->id());
         if (node->timestamp() > m_newest) {
             m_newest = node->timestamp();
@@ -1179,7 +1395,7 @@ void middle_coda_t::apply_nodes()
         }
     }
     u.flush();
-    txn.commit();
+    txn->commit();
     m_changes.clear();
 
     log_debug("CODA middle: {} nodes ({} way node locations) applied in {}, "
@@ -1218,11 +1434,13 @@ void middle_coda_t::apply_ways()
         prefetch(store(), std::move(way_keys));
     }
 
-    txn_t txn{store(), false};
-    updater_t u{&txn, store().dict()};
+    auto txn = std::make_unique<txn_t>(store(), false);
+    updater_t u{txn.get(), store().dict(), m_options->num_procs};
+    std::size_t since_check = 0;
     std::uint64_t loose_in = 0;
     std::uint64_t loose_out = 0;
     for (auto const *way : ways) {
+        bound_txn(store(), &txn, &u, &since_check);
         auto const id = static_cast<id_type>(way->id());
         if (way->timestamp() > m_newest) {
             m_newest = way->timestamp();
@@ -1309,7 +1527,7 @@ void middle_coda_t::apply_ways()
         }
     }
     u.flush();
-    txn.commit();
+    txn->commit();
     m_changes.clear();
 
     log_debug("CODA middle: {} ways applied in {} ({} nodes became loose, {} "
@@ -1343,12 +1561,14 @@ void middle_coda_t::apply_relations()
     }
     prefetch(store(), std::move(keys));
 
-    txn_t txn{store(), false};
-    updater_t u{&txn, store().dict()};
+    auto txn = std::make_unique<txn_t>(store(), false);
+    updater_t u{txn.get(), store().dict(), m_options->num_procs};
+    std::size_t since_check = 0;
     std::uint64_t loose_in = 0;
     std::uint64_t loose_out = 0;
     std::array<db_t, 3> const index = {db_t::n2r, db_t::w2r, db_t::r2r};
     for (auto const *rel : rels) {
+        bound_txn(store(), &txn, &u, &since_check);
         auto const id = static_cast<id_type>(rel->id());
         if (rel->timestamp() > m_newest) {
             m_newest = rel->timestamp();
@@ -1415,12 +1635,12 @@ void middle_coda_t::apply_relations()
     }
     u.flush();
     if (m_newest.valid()) {
-        auto const current = txn.get_meta("current_timestamp");
+        auto const current = txn->get_meta("current_timestamp");
         if (!current || m_newest > osmium::Timestamp{std::string{*current}}) {
-            txn.put_meta("current_timestamp", m_newest.to_iso());
+            txn->put_meta("current_timestamp", m_newest.to_iso());
         }
     }
-    txn.commit();
+    txn->commit();
     m_changes.clear();
     m_changed_locations.clear();
     m_deleted_nodes.clear();
@@ -1455,8 +1675,7 @@ void middle_coda_t::get_node_parents(idlist_t const &changed_nodes,
     index_blocks_t n2r{txn, db_t::n2r, store().dict()};
     std::vector<id_type> ways;
     std::vector<id_type> rels;
-    for (auto const osm_id : changed_nodes) {
-        auto const id = static_cast<id_type>(osm_id);
+    for (auto const id : sorted_ids(changed_nodes)) {
         if (parent_ways) {
             for_parents(n2w.block_of(id), id,
                         [&](id_type parent) { ways.push_back(parent); });
@@ -1493,13 +1712,17 @@ void middle_coda_t::get_way_parents(idlist_t const &changed_ways,
 
     txn_t const txn{store(), true};
     index_blocks_t w2r{txn, db_t::w2r, store().dict()};
-    for (auto const osm_id : changed_ways) {
-        auto const id = static_cast<id_type>(osm_id);
+    for (auto const id : sorted_ids(changed_ways)) {
         for_parents(w2r.block_of(id), id, [&](id_type parent) {
             parent_relations->push_back(static_cast<osmid_t>(parent));
         });
     }
     parent_relations->sort_unique();
+}
+
+void middle_coda_t::set_txn_limit(std::size_t bytes) noexcept
+{
+    txn_limit() = bytes;
 }
 
 std::shared_ptr<middle_query_t> middle_coda_t::get_query_instance()

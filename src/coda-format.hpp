@@ -51,13 +51,16 @@ namespace coda {
 using id_type = std::uint64_t;
 
 /// Version of the block format, stored in the meta database.
-inline constexpr std::uint32_t FORMAT_VERSION = 2;
+inline constexpr std::uint32_t FORMAT_VERSION = 4;
 
 inline constexpr unsigned WAY_SHIFT = 10;  ///< way ids per way block
 inline constexpr unsigned NODE_SHIFT = 12; ///< node ids per loose node block
 inline constexpr unsigned REL_SHIFT = 6;   ///< relation ids per block
 inline constexpr unsigned N2W_SHIFT = 14;  ///< node ids per node->way block
 inline constexpr unsigned X2R_SHIFT = 16;  ///< member ids per ->rel block
+
+/// zstd level for temporary blocks, which are read again only once.
+inline constexpr int FAST_LEVEL = 1;
 
 // ---------------------------------------------------------------- varints
 
@@ -236,6 +239,7 @@ public:
     void decode(reader_t *reader, tags_t *tags) const;
 
     ZSTD_CDict_s const *cdict() const noexcept { return m_cdict; }
+    ZSTD_CDict_s const *cdict_fast() const noexcept { return m_cdict_fast; }
     ZSTD_DDict_s const *ddict() const noexcept { return m_ddict; }
 
 private:
@@ -244,6 +248,7 @@ private:
     std::vector<std::string> m_keys; // index = id, empty if not a key
     std::vector<std::pair<std::string, std::string>> m_tags;
     ZSTD_CDict_s *m_cdict = nullptr;
+    ZSTD_CDict_s *m_cdict_fast = nullptr;
     ZSTD_DDict_s *m_ddict = nullptr;
 };
 
@@ -256,11 +261,20 @@ enum class codec_t : std::uint8_t
     zstd_tags = 2
 };
 
-using streams_t = std::vector<std::pair<codec_t, std::string>>;
+struct stream_t
+{
+    codec_t codec = codec_t::raw;
+    std::string data;
+    int level = 3; ///< zstd level (not stored, only used when encoding)
+};
+
+using streams_t = std::vector<stream_t>;
 
 /**
  * Pack streams into a block: u8 version, varint number of streams, per
  * stream (u8 codec, varint raw length, varint stored length), payloads.
+ * Streams with the zstd_tags codec use the dictionary at its own level, or
+ * at FAST_LEVEL if the stream level is FAST_LEVEL.
  */
 std::string pack(streams_t const &streams, tag_dict_t const &dict);
 std::vector<std::string> unpack(std::string_view block, tag_dict_t const &dict);
@@ -303,7 +317,8 @@ struct relation_t
 /// (member id, parent id) pairs.
 using pairs_t = std::vector<std::pair<id_type, id_type>>;
 
-/// All ways must be from the same block and sorted by id.
+/// All ways must be from the same block and sorted by id. Blocks without
+/// locations are only used temporarily and compressed with FAST_LEVEL.
 std::string encode_ways(std::vector<way_t> const &ways, bool with_locations,
                         tag_dict_t const &dict);
 std::vector<way_t> decode_ways(std::string_view value, id_type block,

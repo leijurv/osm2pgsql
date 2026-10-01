@@ -12,6 +12,7 @@
 #include "coda-build.hpp"
 #include "coda-format.hpp"
 #include "coda-store.hpp"
+#include "format.hpp"
 #include "idlist.hpp"
 #include "middle-coda.hpp"
 #include "options.hpp"
@@ -23,7 +24,9 @@
 
 #include <fstream>
 #include <map>
+#include <optional>
 #include <string>
+#include <vector>
 
 namespace coda {
 
@@ -337,6 +340,244 @@ TEST_CASE("CODA middle: build, update and query")
         mid->stop();
     }
     CHECK(all_blocks("test-coda-c") == all_blocks("test-coda-b"));
+}
+
+TEST_CASE("CODA store: values across chunk boundaries")
+{
+    testing::cleanup::dir_t const cleanup{"test-coda-chunks"};
+    store_t const store{"test-coda-chunks", store_t::mode_t::create};
+
+    auto const chunk = store.chunk_size();
+    auto const value = [](std::size_t size, char c) {
+        std::string data(size, c);
+        for (std::size_t i = 0; i < size; ++i) {
+            data[i] = static_cast<char>(c + static_cast<char>(i % 7));
+        }
+        return data;
+    };
+    std::vector<std::size_t> const sizes = {
+        0, 1, chunk - 1, chunk, chunk + 1, 3 * chunk, 3 * chunk + 17};
+    auto const keys_of = [](txn_t const &txn) {
+        std::vector<id_type> keys;
+        txn.for_each_key(db_t::ways, [&](id_type key) { keys.push_back(key); });
+        return keys;
+    };
+    auto const read = [](txn_t const &txn,
+                         id_type key) -> std::optional<std::string> {
+        auto const v = txn.get(db_t::ways, key);
+        if (!v) {
+            return std::nullopt;
+        }
+        return std::string{v->view()};
+    };
+    auto const chunks_of = [&](txn_t const &txn) {
+        MDB_stat stat;
+        REQUIRE(mdb_stat(txn.get(), store.dbi(db_t::ways), &stat) == 0);
+        return stat.ms_entries;
+    };
+
+    {
+        txn_t const txn{store, true};
+        CHECK(txn.end_key(db_t::ways) == 0);
+    }
+    {
+        txn_t txn{store, false};
+        for (std::size_t i = 0; i < sizes.size(); ++i) {
+            txn.put(db_t::ways, i, value(sizes[i], 'a'), true);
+        }
+        txn.commit();
+    }
+    {
+        txn_t const txn{store, true};
+        for (std::size_t i = 0; i < sizes.size(); ++i) {
+            CHECK(read(txn, i) == value(sizes[i], 'a'));
+        }
+        CHECK_FALSE(read(txn, 100));
+        CHECK(keys_of(txn) == std::vector<id_type>{0, 1, 2, 3, 4, 5, 6});
+        CHECK(txn.end_key(db_t::ways) == 7); // the last block has 4 chunks
+        CHECK(chunks_of(txn) == 1 + 1 + 1 + 1 + 2 + 3 + 4);
+
+        std::size_t n = 0;
+        txn.for_each(db_t::ways, [&](id_type key, std::string_view v) {
+            CHECK(v == value(sizes.at(key), 'a'));
+            ++n;
+        });
+        CHECK(n == sizes.size());
+
+        std::vector<id_type> in;
+        txn.for_each_in(db_t::ways, 3, 5,
+                        [&](id_type key, std::string_view v) {
+                            CHECK(v == value(sizes.at(key), 'a'));
+                            in.push_back(key);
+                        });
+        CHECK(in == std::vector<id_type>{3, 4, 5});
+    }
+
+    // grow and shrink across chunk counts, delete
+    {
+        txn_t txn{store, false};
+        txn.put(db_t::ways, 1, value(2 * chunk + 5, 'b')); // 1 -> 3 chunks
+        txn.put(db_t::ways, 5, value(10, 'c'));            // 3 -> 1 chunk
+        txn.put(db_t::ways, 6, value(chunk, 'd'));         // 4 -> 1 chunk
+        txn.del(db_t::ways, 3);
+        txn.del(db_t::ways, 100); // not there
+        txn.commit();
+    }
+    {
+        txn_t const txn{store, true};
+        CHECK(read(txn, 1) == value(2 * chunk + 5, 'b'));
+        CHECK(read(txn, 5) == value(10, 'c'));
+        CHECK(read(txn, 6) == value(chunk, 'd'));
+        CHECK(read(txn, 4) == value(chunk + 1, 'a'));
+        CHECK_FALSE(read(txn, 3));
+        CHECK(keys_of(txn) == std::vector<id_type>{0, 1, 2, 4, 5, 6});
+        CHECK(chunks_of(txn) == 1 + 3 + 1 + 2 + 1 + 1);
+    }
+}
+
+TEST_CASE("CODA store: split tails")
+{
+    testing::cleanup::dir_t const cleanup{"test-coda-split"};
+    store_t const store{"test-coda-split", store_t::mode_t::create};
+
+    auto const chunk = store.chunk_size();
+    auto const inl = store.inline_size();
+    auto const value = [](std::size_t size, char c) {
+        std::string data(size, c);
+        for (std::size_t i = 0; i < size; ++i) {
+            data[i] = static_cast<char>(c + static_cast<char>(i % 5));
+        }
+        return data;
+    };
+    // size and number of chunks it is stored in
+    std::vector<std::pair<std::size_t, std::size_t>> const sizes = {
+        {inl, 1},             {inl + 1, 2},         {2 * inl, 2},
+        {2 * inl + 1, 1},     {chunk, 1},           {2 * chunk, 2},
+        {chunk + inl + 1, 3}, {chunk + 2 * inl + 1, 2}};
+    auto const read = [](txn_t const &txn,
+                         id_type key) -> std::optional<std::string> {
+        auto const v = txn.get(db_t::ways, key);
+        if (!v) {
+            return std::nullopt;
+        }
+        return std::string{v->view()};
+    };
+    auto const chunks_of = [&](txn_t const &txn) {
+        MDB_stat stat;
+        REQUIRE(mdb_stat(txn.get(), store.dbi(db_t::ways), &stat) == 0);
+        return stat.ms_entries;
+    };
+
+    std::size_t total = 0;
+    {
+        txn_t txn{store, false};
+        for (std::size_t i = 0; i < sizes.size(); ++i) {
+            txn.put(db_t::ways, i, value(sizes[i].first, 'a'), true);
+            total += sizes[i].second;
+        }
+        txn.commit();
+    }
+    {
+        txn_t const txn{store, true};
+        for (std::size_t i = 0; i < sizes.size(); ++i) {
+            CHECK(read(txn, i) == value(sizes[i].first, 'a'));
+        }
+        CHECK(chunks_of(txn) == total);
+        std::size_t n = 0;
+        txn.for_each(db_t::ways, [&](id_type key, std::string_view v) {
+            CHECK(v == value(sizes.at(key).first, 'a'));
+            ++n;
+        });
+        CHECK(n == sizes.size());
+    }
+    {
+        txn_t txn{store, false};
+        txn.put(db_t::ways, 1, value(10, 'b'));        // 2 -> 1 chunk
+        txn.put(db_t::ways, 0, value(inl + 7, 'c'));   // 1 -> 2 chunks
+        txn.put(db_t::ways, 6, value(chunk - 1, 'd')); // 3 -> 1 chunk
+        txn.commit();
+        total += -1 + 1 - 2;
+    }
+    {
+        txn_t const txn{store, true};
+        CHECK(read(txn, 0) == value(inl + 7, 'c'));
+        CHECK(read(txn, 1) == value(10, 'b'));
+        CHECK(read(txn, 6) == value(chunk - 1, 'd'));
+        CHECK(read(txn, 7) == value(sizes[7].first, 'a'));
+        CHECK(chunks_of(txn) == total);
+    }
+}
+
+namespace {
+
+/// A grid of nodes with ways along the rows, and changes to many of them.
+std::pair<std::string, std::string> many_objects()
+{
+    std::string state;
+    std::string changes;
+    constexpr int ROWS = 600; // more changed objects than are checked at once
+    constexpr int COLS = 20;
+    for (int r = 0; r < ROWS; ++r) {
+        for (int c = 0; c < COLS; ++c) {
+            auto const id = (r * COLS) + c + 1;
+            state += fmt::format("n{} v1 x{:.4f} y{:.4f}\n", id, c * 0.001,
+                                 r * 0.001);
+            if (c % 3 == 0) { // move every third node
+                changes += fmt::format("n{} v2 x{:.4f} y{:.4f}\n", id,
+                                       (c * 0.001) + 0.0001, r * 0.001);
+            }
+        }
+    }
+    for (int r = 0; r < ROWS; ++r) {
+        std::string nodes;
+        for (int c = 0; c < COLS; ++c) {
+            nodes += fmt::format("{}n{}", c ? "," : "", (r * COLS) + c + 1);
+        }
+        state += fmt::format("w{} v1 Thighway=residential N{}\n", r + 1, nodes);
+        if (r % 2 == 0) { // shorten every second way, the rest become loose
+            changes += fmt::format("w{} v2 Thighway=service Nn{},n{}\n", r + 1,
+                                   (r * COLS) + 1, (r * COLS) + 2);
+        }
+    }
+    state += "r1 v1 Ttype=route Mw1@,w2@,n3@stop\n";
+    changes += "r1 v2 Ttype=route Mw2@,w3@\n";
+    return {state, changes};
+}
+
+} // anonymous namespace
+
+TEST_CASE("CODA middle: updates committed in parts give the same result")
+{
+    testing::cleanup::dir_t const cleanup_a{"test-coda-txn-a"};
+    testing::cleanup::dir_t const cleanup_b{"test-coda-txn-b"};
+    testing::cleanup::file_t const cleanup_state{"test-coda-txn.opl"};
+    auto const data = many_objects();
+    std::string const &changes = data.second;
+    write_file("test-coda-txn.opl", data.first);
+    build(osmium::io::File{"test-coda-txn.opl"}, "test-coda-txn-a", 2);
+    build(osmium::io::File{"test-coda-txn.opl"}, "test-coda-txn-b", 2);
+
+    auto thread_pool = std::make_shared<thread_pool_t>(1U);
+    auto const update = [&](char const *dir, std::size_t limit) {
+        middle_coda_t::set_txn_limit(limit);
+        auto const options = coda_options(dir, true);
+        auto mid = std::make_shared<middle_coda_t>(thread_pool, &options);
+        mid->start();
+        apply(mid.get(), changes.c_str());
+        mid->stop();
+        middle_coda_t::set_txn_limit(64UL * 1000UL * 1000UL);
+    };
+    update("test-coda-txn-a", 1); // commit as often as possible
+    update("test-coda-txn-b", 64UL * 1000UL * 1000UL);
+
+    auto const txn_id = [](char const *dir) {
+        store_t const store{dir, store_t::mode_t::read};
+        MDB_envinfo info;
+        REQUIRE(mdb_env_info(store.env(), &info) == 0);
+        return info.me_last_txnid;
+    };
+    CHECK(txn_id("test-coda-txn-a") > txn_id("test-coda-txn-b"));
+    CHECK(all_blocks("test-coda-txn-a") == all_blocks("test-coda-txn-b"));
 }
 
 } // namespace coda

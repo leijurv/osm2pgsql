@@ -88,7 +88,7 @@ std::uint64_t scatter(store_t const &store, db_t index, db_t objects,
     std::vector<id_type> keys;
     {
         txn_t const txn{store, true};
-        txn.for_each(index, [&](id_type key, std::string_view /*value*/) {
+        txn.for_each_key(index, [&](id_type key) {
             keys.push_back(key);
         });
     }

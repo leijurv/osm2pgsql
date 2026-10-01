@@ -34,6 +34,7 @@
 
 #include <osmium/memory/buffer.hpp>
 
+#include <cstddef>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -75,6 +76,12 @@ public:
                          idlist_t *parent_relations) const override;
 
     std::shared_ptr<middle_query_t> get_query_instance() override;
+
+    /**
+     * Commit updates whenever the changed blocks reach this many bytes
+     * (default 64 MB). Only for tests.
+     */
+    static void set_txn_limit(std::size_t bytes) noexcept;
 
     void set_requirements(output_requirements const &requirements) override;
 

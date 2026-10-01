@@ -11,6 +11,7 @@
 
 #include "format.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <filesystem>
@@ -38,6 +39,9 @@ std::string const &meta_format_key()
     static std::string const key{"format_version"};
     return key;
 }
+
+/// Size of the page header in front of the data of an LMDB overflow page.
+constexpr std::size_t PAGE_HEADER_SIZE = 16;
 
 /// LMDB takes keys and values as non-const pointers, but doesn't change them.
 MDB_val to_val(std::string_view data) noexcept
@@ -112,6 +116,12 @@ store_t::store_t(std::string dir, mode_t mode) : m_dir(std::move(dir))
         m_dict = std::make_unique<tag_dict_t>(
             txn.get_meta("dict_entries").value_or(""),
             txn.get_meta("dict_zstd").value_or(""));
+        MDB_stat stat;
+        check(mdb_env_stat(m_env, &stat), "env_stat");
+        m_chunk_size = stat.ms_psize - PAGE_HEADER_SIZE;
+        // LMDB's limit for a node in a leaf page, minus node header and key
+        m_inline_size = (((stat.ms_psize - PAGE_HEADER_SIZE) / 2) & ~1U) -
+                        8 - sizeof(id_type);
         txn.commit();
     } catch (...) {
         mdb_env_close(m_env);
@@ -186,32 +196,118 @@ void txn_t::reset() noexcept { mdb_txn_reset(m_txn); }
 
 void txn_t::renew() { check(mdb_txn_renew(m_txn), "txn_renew"); }
 
-std::optional<std::string_view> txn_t::get(db_t db, id_type key) const
+std::optional<value_t> txn_t::get(db_t db, id_type key) const
 {
-    MDB_val k{sizeof(key), &key};
+    id_type raw = key << CHUNK_BITS;
+    MDB_val k{sizeof(raw), &raw};
     MDB_val v;
     int const rc = mdb_get(m_txn, m_store->dbi(db), &k, &v);
     if (rc == MDB_NOTFOUND) {
         return std::nullopt;
     }
     check(rc, "get");
-    return std::string_view{static_cast<char const *>(v.mv_data), v.mv_size};
+    auto const first = to_view(v);
+
+    // all chunks with this block number
+    std::string data;
+    scan(db, raw + 1, [&](id_type chunk_key, MDB_val const &chunk) {
+        if ((chunk_key >> CHUNK_BITS) != key) {
+            return false;
+        }
+        if (data.empty()) {
+            data.assign(first);
+        }
+        data.append(to_view(chunk));
+        return true;
+    });
+    if (data.empty()) {
+        return value_t{first};
+    }
+    return value_t{std::move(data)};
+}
+
+id_type txn_t::end_key(db_t db) const
+{
+    cursor_t const cursor{*this, db};
+    MDB_val k;
+    MDB_val v;
+    int const rc = mdb_cursor_get(cursor.get(), &k, &v, MDB_LAST);
+    if (rc == MDB_NOTFOUND) {
+        return 0;
+    }
+    check(rc, "cursor");
+    id_type raw = 0;
+    std::memcpy(&raw, k.mv_data, sizeof(raw));
+    return (raw >> CHUNK_BITS) + 1;
+}
+
+std::vector<id_type> txn_t::chunk_keys(db_t db, id_type key) const
+{
+    std::vector<id_type> keys;
+    scan(db, key << CHUNK_BITS, [&](id_type chunk_key, MDB_val const &) {
+        if ((chunk_key >> CHUNK_BITS) != key) {
+            return false;
+        }
+        keys.push_back(chunk_key);
+        return true;
+    });
+    return keys;
 }
 
 void txn_t::put(db_t db, id_type key, std::string_view value, bool append)
 {
-    MDB_val k{sizeof(key), &key};
-    MDB_val v = to_val(value);
-    check(mdb_put(m_txn, m_store->dbi(db), &k, &v, append ? MDB_APPEND : 0U),
-          "put");
+    auto const dbi = m_store->dbi(db);
+    unsigned const flags = append ? MDB_APPEND : 0U;
+
+    // full chunks, then the rest as one chunk or as two inline halves
+    auto const chunk_size = m_store->chunk_size();
+    std::vector<std::string_view> pieces;
+    std::size_t pos = 0;
+    while (value.size() - pos > chunk_size) {
+        pieces.push_back(value.substr(pos, chunk_size));
+        pos += chunk_size;
+    }
+    auto const tail = value.substr(pos);
+    if (tail.size() > m_store->inline_size() &&
+        tail.size() <= 2 * m_store->inline_size()) {
+        auto const half = (tail.size() + 1) / 2;
+        pieces.push_back(tail.substr(0, half));
+        pieces.push_back(tail.substr(half));
+    } else {
+        pieces.push_back(tail);
+    }
+    std::size_t const chunks = pieces.size();
+    if (chunks > (std::size_t{1} << CHUNK_BITS)) {
+        throw fmt_error("CODA middle: block {} is too large ({} bytes).", key,
+                        value.size());
+    }
+    // Chunks the old value had in addition to the new one.
+    std::vector<id_type> stale;
+    if (!append) {
+        stale = chunk_keys(db, key);
+        stale.erase(stale.begin(),
+                    stale.begin() +
+                        static_cast<std::ptrdiff_t>(
+                            std::min(chunks, stale.size())));
+    }
+    for (std::size_t i = 0; i < chunks; ++i) {
+        id_type raw = (key << CHUNK_BITS) | i;
+        MDB_val k{sizeof(raw), &raw};
+        MDB_val v = to_val(pieces[i]);
+        check(mdb_put(m_txn, dbi, &k, &v, flags), "put");
+    }
+    for (auto raw : stale) {
+        MDB_val k{sizeof(raw), &raw};
+        check(mdb_del(m_txn, dbi, &k, nullptr), "del");
+    }
 }
 
 void txn_t::del(db_t db, id_type key)
 {
-    MDB_val k{sizeof(key), &key};
-    int const rc = mdb_del(m_txn, m_store->dbi(db), &k, nullptr);
-    if (rc != MDB_NOTFOUND) {
-        check(rc, "del");
+    auto const dbi = m_store->dbi(db);
+    for (auto raw : chunk_keys(db, key)) {
+        MDB_val k{sizeof(raw), &raw};
+        check(mdb_del(m_txn, dbi, &k, nullptr), "del");
     }
 }
 

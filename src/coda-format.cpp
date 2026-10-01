@@ -63,7 +63,10 @@ zstd_contexts_t &zstd_contexts()
     return contexts;
 }
 
-constexpr int ZSTD_LEVEL = 3;
+constexpr int TAGS_LEVEL = 6;  ///< tag streams (with the dictionary)
+constexpr int IDS_LEVEL = 5;   ///< node ids of ways
+constexpr int REL_LEVEL = 5;   ///< relation ids, members, roles
+constexpr int INDEX_LEVEL = 1; ///< parent index blocks (6 is only 1.5% smaller)
 
 std::string unescape(std::string_view str)
 {
@@ -241,9 +244,11 @@ tag_dict_t::tag_dict_t(std::string_view entries, std::string_view zstd_dict)
 
     if (!zstd_dict.empty()) {
         m_cdict =
-            ZSTD_createCDict(zstd_dict.data(), zstd_dict.size(), ZSTD_LEVEL);
+            ZSTD_createCDict(zstd_dict.data(), zstd_dict.size(), TAGS_LEVEL);
+        m_cdict_fast =
+            ZSTD_createCDict(zstd_dict.data(), zstd_dict.size(), FAST_LEVEL);
         m_ddict = ZSTD_createDDict(zstd_dict.data(), zstd_dict.size());
-        if (!m_cdict || !m_ddict) {
+        if (!m_cdict || !m_cdict_fast || !m_ddict) {
             throw std::runtime_error{"CODA middle: bad zstd dictionary."};
         }
     }
@@ -252,6 +257,7 @@ tag_dict_t::tag_dict_t(std::string_view entries, std::string_view zstd_dict)
 tag_dict_t::~tag_dict_t() noexcept
 {
     ZSTD_freeCDict(m_cdict);
+    ZSTD_freeCDict(m_cdict_fast);
     ZSTD_freeDDict(m_ddict);
 }
 
@@ -306,7 +312,7 @@ std::string pack(streams_t const &streams, tag_dict_t const &dict)
     auto &z = zstd_contexts();
     std::vector<std::pair<codec_t, std::string>> stored;
     stored.reserve(streams.size());
-    for (auto const &[codec, data] : streams) {
+    for (auto const &[codec, data, level] : streams) {
         if (codec == codec_t::raw || data.size() < MIN_COMPRESS) {
             stored.emplace_back(codec_t::raw, data);
             continue;
@@ -314,11 +320,12 @@ std::string pack(streams_t const &streams, tag_dict_t const &dict)
         z.buffer.resize(ZSTD_compressBound(data.size()));
         std::size_t const size =
             (codec == codec_t::zstd_tags && dict.cdict())
-                ? ZSTD_compress_usingCDict(z.cctx, z.buffer.data(),
-                                           z.buffer.size(), data.data(),
-                                           data.size(), dict.cdict())
+                ? ZSTD_compress_usingCDict(
+                      z.cctx, z.buffer.data(), z.buffer.size(), data.data(),
+                      data.size(),
+                      level == FAST_LEVEL ? dict.cdict_fast() : dict.cdict())
                 : ZSTD_compressCCtx(z.cctx, z.buffer.data(), z.buffer.size(),
-                                    data.data(), data.size(), ZSTD_LEVEL);
+                                    data.data(), data.size(), level);
         if (ZSTD_isError(size)) {
             throw std::runtime_error{"CODA middle: zstd compression failed."};
         }
@@ -334,7 +341,7 @@ std::string pack(streams_t const &streams, tag_dict_t const &dict)
     w.varint(stored.size());
     for (std::size_t i = 0; i < stored.size(); ++i) {
         w.byte(static_cast<std::uint8_t>(stored[i].first));
-        w.varint(streams[i].second.size());
+        w.varint(streams[i].data.size());
         w.varint(stored[i].second.size());
     }
     for (auto const &s : stored) {
@@ -392,59 +399,207 @@ std::vector<std::string> unpack(std::string_view block, tag_dict_t const &dict)
     return result;
 }
 
+namespace {
+
+/**
+ * Node id -> location map for one way block (open addressing, id 0 marks
+ * an empty slot). Reused between blocks of the same thread.
+ */
+class block_locations_t
+{
+public:
+    struct slot_t
+    {
+        id_type id = 0;
+        osmium::Location location{};
+    };
+
+    void reset(std::size_t count)
+    {
+        unsigned bits = 4;
+        while ((std::size_t{1} << bits) < count * 2) {
+            ++bits;
+        }
+        m_shift = 64 - bits;
+        m_slots.assign(std::size_t{1} << bits, slot_t{0, osmium::Location{}});
+    }
+
+    slot_t &find(id_type id) noexcept
+    {
+        auto const mask = m_slots.size() - 1;
+        auto n = static_cast<std::size_t>((id * 0x9e3779b97f4a7c15ULL) >>
+                                          m_shift);
+        while (m_slots[n].id != 0 && m_slots[n].id != id) {
+            n = (n + 1) & mask;
+        }
+        return m_slots[n];
+    }
+
+private:
+    std::vector<slot_t> m_slots;
+    unsigned m_shift = 60;
+};
+
+block_locations_t &block_locations()
+{
+    thread_local block_locations_t table;
+    return table;
+}
+
+using point_t = std::array<std::int64_t, 2>;
+
+point_t to_point(osmium::Location loc) noexcept { return {loc.x(), loc.y()}; }
+
+enum class predictor_t : std::uint8_t
+{
+    previous,     ///< previous location
+    linear,       ///< extrapolated from the two previous locations
+    parallelogram ///< fourth corner of a closed quadrilateral
+};
+
+/**
+ * The predictor is derived from the way, so it is not stored. Small closed
+ * rings are mostly buildings with right angles, where continuing straight
+ * overshoots every corner, so they use the previous location, and the fourth
+ * corner of a quadrilateral is almost exactly opposite the second one. Lines
+ * and larger polygons are smoother: extrapolating from the two previous
+ * locations predicts better (measured on New Jersey: 1.7% fewer bits than
+ * using linear for all but four node ways).
+ */
+predictor_t predictor_for(std::size_t stored_nodes, bool closed) noexcept
+{
+    constexpr std::size_t MAX_RING = 16;
+    if (closed && stored_nodes <= MAX_RING) {
+        return stored_nodes == 4 ? predictor_t::parallelogram
+                                 : predictor_t::previous;
+    }
+    return predictor_t::linear;
+}
+
+point_t predict(std::vector<osmium::Location> const &locations, std::size_t i,
+                predictor_t predictor, point_t previous) noexcept
+{
+    if (predictor == predictor_t::linear && i >= 2) {
+        auto const a = to_point(locations[i - 1]);
+        auto const b = to_point(locations[i - 2]);
+        return {2 * a[0] - b[0], 2 * a[1] - b[1]};
+    }
+    if (predictor == predictor_t::parallelogram && i == 3) {
+        auto const a = to_point(locations[0]);
+        auto const b = to_point(locations[1]);
+        auto const c = to_point(locations[2]);
+        return {a[0] + c[0] - b[0], a[1] + c[1] - b[1]};
+    }
+    return previous;
+}
+
+/// Number of nodes stored for a way: the closing node is not repeated.
+std::size_t stored_nodes(way_t const &way, bool with_locations) noexcept
+{
+    auto const n = way.nodes.size();
+    bool const closed =
+        n >= 2 && way.nodes.front() == way.nodes.back() &&
+        (!with_locations || way.locations.front() == way.locations.back());
+    return closed ? n - 1 : n;
+}
+
+constexpr std::uint8_t WAY_FLAG_LOCATIONS = 1U;
+constexpr std::uint8_t WAY_FLAG_DEDUP = 2U;
+
+} // anonymous namespace
+
 // Way block: presence (bitmap, or count + slot deltas for sparse blocks),
-// node counts (n << 1 | closed), node id delta chain, location deltas (split
-// coding: symbols, raw bits), tags. The first node of a closed way is not
-// repeated at the end.
+// node counts (n << 1 | closed), node id delta chain, location residuals
+// (split coding: symbols, raw bits), tags, residuals of the first location of
+// each way (split coding), flags. The first node of a closed way is not
+// repeated at the end. Locations are predicted from the previous ones (see
+// predictor_for()). Each node location is only stored the first time the
+// node appears in the block, unless the block has different locations for
+// the same node.
 std::string encode_ways(std::vector<way_t> const &ways, bool with_locations,
                         tag_dict_t const &dict)
 {
     constexpr unsigned SLOTS = 1U << WAY_SHIFT;
+
+    bool dedup = false;
+    auto &seen = block_locations();
+    if (with_locations) {
+        std::size_t refs = 0;
+        for (auto const &way : ways) {
+            refs += stored_nodes(way, true);
+        }
+        seen.reset(refs);
+        dedup = true;
+        for (auto const &way : ways) {
+            auto const ne = stored_nodes(way, true);
+            for (std::size_t i = 0; i < ne && dedup; ++i) {
+                auto &slot = seen.find(way.nodes[i]);
+                if (slot.id != 0 && slot.location != way.locations[i]) {
+                    dedup = false;
+                }
+                slot.id = way.nodes[i];
+                slot.location = way.locations[i];
+            }
+        }
+        if (dedup) {
+            seen.reset(refs);
+        }
+    }
+
     std::string bitmap(SLOTS / 8, '\0');
     writer_t counts;
     writer_t ids;
     writer_t tags;
     split_writer_t locs;
+    split_writer_t heads;
     std::int64_t pid = 0;
-    std::int64_t px = 0;
-    std::int64_t py = 0;
+    point_t prev{0, 0};
     for (auto const &way : ways) {
         auto const slot = slot_of(way.id, WAY_SHIFT);
         bitmap[slot / 8] = static_cast<char>(
             static_cast<unsigned>(bitmap[slot / 8]) | (1U << (slot % 8)));
-        auto const n = way.nodes.size();
-        bool const closed =
-            n >= 2 && way.nodes.front() == way.nodes.back() &&
-            (!with_locations || way.locations.front() == way.locations.back());
-        auto const ne = closed ? n - 1 : n;
+        auto const ne = stored_nodes(way, with_locations);
+        bool const closed = ne != way.nodes.size();
         counts.varint((static_cast<std::uint64_t>(ne) << 1U) |
                       (closed ? 1U : 0U));
+        auto const predictor = predictor_for(ne, closed);
         for (std::size_t i = 0; i < ne; ++i) {
             auto const id = static_cast<std::int64_t>(way.nodes[i]);
             ids.svarint(id - pid);
             pid = id;
-            if (with_locations) {
-                auto const &loc = way.locations[i];
-                locs.sput(static_cast<std::int64_t>(loc.x()) - px);
-                locs.sput(static_cast<std::int64_t>(loc.y()) - py);
-                px = loc.x();
-                py = loc.y();
+            if (!with_locations) {
+                continue;
             }
+            auto const loc = to_point(way.locations[i]);
+            bool fresh = true;
+            if (dedup) {
+                auto &entry = seen.find(way.nodes[i]);
+                fresh = entry.id == 0;
+                entry.id = way.nodes[i];
+            }
+            if (fresh) {
+                auto const p = predict(way.locations, i, predictor, prev);
+                auto &coder = (i == 0) ? heads : locs;
+                coder.sput(loc[0] - p[0]);
+                coder.sput(loc[1] - p[1]);
+            }
+            prev = loc;
         }
         dict.encode(&tags, way.tags);
     }
     locs.finish();
+    heads.finish();
 
     std::string presence;
     if (ways.size() * 2 + 2 < bitmap.size()) {
         writer_t list;
         list.byte(1);
         list.varint(ways.size());
-        unsigned prev = 0;
+        unsigned prev_slot = 0;
         for (auto const &way : ways) {
             auto const slot = slot_of(way.id, WAY_SHIFT);
-            list.varint(slot - prev);
-            prev = slot;
+            list.varint(slot - prev_slot);
+            prev_slot = slot;
         }
         presence = std::move(list.data());
     } else {
@@ -452,12 +607,19 @@ std::string encode_ways(std::vector<way_t> const &ways, bool with_locations,
         presence += bitmap;
     }
 
-    return pack({{codec_t::raw, std::move(presence)},
-                 {codec_t::zstd, std::move(counts.data())},
-                 {codec_t::zstd, std::move(ids.data())},
+    std::uint8_t const flags =
+        (with_locations ? WAY_FLAG_LOCATIONS : 0U) | (dedup ? WAY_FLAG_DEDUP : 0U);
+    int const level = with_locations ? 3 : FAST_LEVEL;
+    return pack({{codec_t::zstd, std::move(presence), level},
+                 {codec_t::zstd, std::move(counts.data()), level},
+                 {codec_t::zstd, std::move(ids.data()),
+                  with_locations ? IDS_LEVEL : FAST_LEVEL},
                  {codec_t::zstd, std::move(locs.symbols())},
                  {codec_t::raw, std::move(locs.bits())},
-                 {codec_t::zstd_tags, std::move(tags.data())}},
+                 {codec_t::zstd_tags, std::move(tags.data()), level},
+                 {codec_t::zstd, std::move(heads.symbols())},
+                 {codec_t::raw, std::move(heads.bits())},
+                 {codec_t::raw, std::string(1, static_cast<char>(flags))}},
                 dict);
 }
 
@@ -465,9 +627,12 @@ std::vector<way_t> decode_ways(std::string_view value, id_type block,
                                tag_dict_t const &dict, bool with_tags)
 {
     auto const st = unpack(value, dict);
-    if (st.size() != 6 || st[0].empty()) {
+    if (st.size() != 9 || st[0].empty() || st[8].size() != 1) {
         throw corrupt("way block");
     }
+    auto const flags = static_cast<std::uint8_t>(st[8][0]);
+    bool const has_locations = flags & WAY_FLAG_LOCATIONS;
+    bool const dedup = flags & WAY_FLAG_DEDUP;
 
     std::vector<unsigned> slots;
     if (static_cast<std::uint8_t>(st[0][0]) == 1) {
@@ -491,14 +656,23 @@ std::vector<way_t> decode_ways(std::string_view value, id_type block,
         }
     }
 
+    auto &seen = block_locations();
+    if (dedup) {
+        reader_t counts{st[1]};
+        std::size_t refs = 0;
+        for (std::size_t w = 0; w < slots.size(); ++w) {
+            refs += counts.varint() >> 1U;
+        }
+        seen.reset(refs);
+    }
+
     reader_t counts{st[1]};
     reader_t ids{st[2]};
     reader_t tags{st[5]};
     split_reader_t locs{st[3], st[4]};
-    bool const has_locations = !st[3].empty();
+    split_reader_t heads{st[6], st[7]};
     std::int64_t pid = 0;
-    std::int64_t px = 0;
-    std::int64_t py = 0;
+    point_t prev{0, 0};
 
     std::vector<way_t> result(slots.size());
     for (std::size_t w = 0; w < slots.size(); ++w) {
@@ -511,15 +685,30 @@ std::vector<way_t> decode_ways(std::string_view value, id_type block,
         if (has_locations) {
             way.locations.resize(way.nodes.size());
         }
+        auto const predictor = predictor_for(ne, closed);
         for (std::size_t i = 0; i < ne; ++i) {
             pid += ids.svarint();
             way.nodes[i] = static_cast<id_type>(pid);
-            if (has_locations) {
-                px += locs.sget();
-                py += locs.sget();
-                way.locations[i] = osmium::Location{static_cast<int32_t>(px),
-                                                    static_cast<int32_t>(py)};
+            if (!has_locations) {
+                continue;
             }
+            block_locations_t::slot_t *entry =
+                dedup ? &seen.find(way.nodes[i]) : nullptr;
+            if (entry && entry->id != 0) {
+                way.locations[i] = entry->location;
+            } else {
+                auto const p = predict(way.locations, i, predictor, prev);
+                auto &coder = (i == 0) ? heads : locs;
+                auto const x = p[0] + coder.sget();
+                auto const y = p[1] + coder.sget();
+                way.locations[i] = osmium::Location{static_cast<int32_t>(x),
+                                                    static_cast<int32_t>(y)};
+                if (entry) {
+                    entry->id = way.nodes[i];
+                    entry->location = way.locations[i];
+                }
+            }
+            prev = to_point(way.locations[i]);
         }
         if (closed) {
             way.nodes[ne] = way.nodes[0];
@@ -617,10 +806,10 @@ std::string encode_relations(std::vector<relation_t> const &relations,
         }
         dict.encode(&tags, rel.tags);
     }
-    return pack({{codec_t::zstd, std::move(ids.data())},
-                 {codec_t::zstd, std::move(counts.data())},
-                 {codec_t::zstd, std::move(members.data())},
-                 {codec_t::zstd, std::move(roles.data())},
+    return pack({{codec_t::zstd, std::move(ids.data()), REL_LEVEL},
+                 {codec_t::zstd, std::move(counts.data()), REL_LEVEL},
+                 {codec_t::zstd, std::move(members.data()), REL_LEVEL},
+                 {codec_t::zstd, std::move(roles.data()), REL_LEVEL},
                  {codec_t::zstd_tags, std::move(tags.data())}},
                 dict);
 }
@@ -661,12 +850,18 @@ std::vector<relation_t> decode_relations(std::string_view value, id_type block,
 }
 
 // Parent index block: runs of consecutive members with the same parent,
-// grouped by parent: parent deltas, number of runs per parent - 1, run start
-// (zigzag delta against the end of the previous run of the same parent, the
-// first against the block base), run length - 1.
+// grouped by parent. Streams: parent deltas, number of runs per parent - 1,
+// run length - 1, start of the first run of each parent (zigzag delta against
+// the end of the previous run in the block, split coding), start of the
+// other runs (gap after the previous run of the same parent, split coding).
+// Small blocks can instead use a 4 stream layout (parent deltas, runs, run
+// start as zigzag delta against the end of the previous run of the same
+// parent, the first against the block base, run lengths) if that is smaller.
 std::string encode_pairs(pairs_t const &pairs, id_type base,
                          tag_dict_t const &dict)
 {
+    constexpr std::size_t TRY_SIMPLE = 64;
+
     pairs_t by_parent;
     by_parent.reserve(pairs.size());
     for (auto const &[member, parent] : pairs) {
@@ -674,11 +869,15 @@ std::string encode_pairs(pairs_t const &pairs, id_type base,
     }
     std::sort(by_parent.begin(), by_parent.end());
 
+    bool const simple = pairs.size() <= TRY_SIMPLE;
     writer_t parents;
     writer_t runs;
-    writer_t starts;
     writer_t lengths;
+    split_writer_t firsts;
+    split_writer_t gaps;
+    writer_t starts; // only for the simple layout
     id_type prev_parent = 0;
+    auto prev_end = static_cast<std::int64_t>(base);
     std::size_t i = 0;
     std::vector<std::pair<id_type, id_type>> parent_runs;
     while (i < by_parent.size()) {
@@ -699,48 +898,143 @@ std::string encode_pairs(pairs_t const &pairs, id_type base,
             i = j;
         }
         runs.varint(parent_runs.size() - 1);
-        auto prev_end = static_cast<std::int64_t>(base);
+        auto simple_end = static_cast<std::int64_t>(base);
+        bool first = true;
         for (auto const &[start, len] : parent_runs) {
-            starts.svarint(static_cast<std::int64_t>(start) - prev_end);
+            auto const s = static_cast<std::int64_t>(start);
+            if (first) {
+                firsts.sput(s - prev_end);
+                first = false;
+            } else {
+                gaps.put(static_cast<std::uint64_t>(s - prev_end));
+            }
             prev_end = static_cast<std::int64_t>(start + len);
             lengths.varint(len - 1);
+            if (simple) {
+                starts.svarint(s - simple_end);
+                simple_end = prev_end;
+            }
         }
     }
-    return pack({{codec_t::zstd, std::move(parents.data())},
-                 {codec_t::zstd, std::move(runs.data())},
-                 {codec_t::zstd, std::move(starts.data())},
-                 {codec_t::zstd, std::move(lengths.data())}},
-                dict);
+    firsts.finish();
+    gaps.finish();
+
+    std::string simple_value;
+    if (simple) {
+        simple_value = pack({{codec_t::zstd, parents.data(), INDEX_LEVEL},
+                             {codec_t::zstd, runs.data(), INDEX_LEVEL},
+                             {codec_t::zstd, std::move(starts.data()),
+                              INDEX_LEVEL},
+                             {codec_t::zstd, lengths.data(), INDEX_LEVEL}},
+                            dict);
+    }
+    auto value = pack({{codec_t::zstd, std::move(parents.data()), INDEX_LEVEL},
+                       {codec_t::zstd, std::move(runs.data()), INDEX_LEVEL},
+                       {codec_t::zstd, std::move(lengths.data()), INDEX_LEVEL},
+                       {codec_t::zstd, std::move(firsts.symbols()),
+                        INDEX_LEVEL},
+                       {codec_t::raw, std::move(firsts.bits())},
+                       {codec_t::zstd, std::move(gaps.symbols()), INDEX_LEVEL},
+                       {codec_t::raw, std::move(gaps.bits())}},
+                      dict);
+    if (simple && simple_value.size() < value.size()) {
+        return simple_value;
+    }
+    return value;
 }
+
+namespace {
+
+/**
+ * Sort (member, parent) pairs by member, keeping the order of pairs with the
+ * same member: a stable counting sort, because the members of a block are
+ * close together. The pairs of a member are decoded in parent order, so this
+ * gives the same order as sorting the pairs.
+ */
+void sort_by_member(pairs_t *pairs)
+{
+    auto const n = pairs->size();
+    if (n < 2) {
+        return;
+    }
+    auto lo = pairs->front().first;
+    auto hi = lo;
+    for (auto const &pair : *pairs) {
+        lo = std::min(lo, pair.first);
+        hi = std::max(hi, pair.first);
+    }
+    auto const range = hi - lo + 1;
+    if (range / 16 > n) {
+        std::sort(pairs->begin(), pairs->end());
+        return;
+    }
+    thread_local std::vector<std::size_t> start;
+    start.assign(range + 1, 0);
+    for (auto const &pair : *pairs) {
+        ++start[pair.first - lo + 1];
+    }
+    for (std::size_t i = 1; i <= range; ++i) {
+        start[i] += start[i - 1];
+    }
+    pairs_t sorted(n);
+    for (auto const &pair : *pairs) {
+        sorted[start[pair.first - lo]++] = pair;
+    }
+    pairs->swap(sorted);
+}
+
+} // anonymous namespace
 
 pairs_t decode_pairs(std::string_view value, id_type base,
                      tag_dict_t const &dict)
 {
     auto const st = unpack(value, dict);
-    if (st.size() != 4) {
-        throw corrupt("index block");
-    }
-    reader_t parents{st[0]};
-    reader_t runs{st[1]};
-    reader_t starts{st[2]};
-    reader_t lengths{st[3]};
     pairs_t result;
     id_type parent = 0;
-    while (!parents.done()) {
-        parent += parents.varint();
-        auto const num_runs = runs.varint() + 1;
-        auto prev_end = static_cast<std::int64_t>(base);
-        for (std::uint64_t r = 0; r < num_runs; ++r) {
-            auto const start =
-                static_cast<id_type>(prev_end + starts.svarint());
-            auto const len = lengths.varint() + 1;
-            for (id_type k = 0; k < len; ++k) {
-                result.emplace_back(start + k, parent);
+    if (st.size() == 4) {
+        reader_t parents{st[0]};
+        reader_t runs{st[1]};
+        reader_t starts{st[2]};
+        reader_t lengths{st[3]};
+        while (!parents.done()) {
+            parent += parents.varint();
+            auto const num_runs = runs.varint() + 1;
+            auto prev_end = static_cast<std::int64_t>(base);
+            for (std::uint64_t r = 0; r < num_runs; ++r) {
+                auto const start =
+                    static_cast<id_type>(prev_end + starts.svarint());
+                auto const len = lengths.varint() + 1;
+                for (id_type k = 0; k < len; ++k) {
+                    result.emplace_back(start + k, parent);
+                }
+                prev_end = static_cast<std::int64_t>(start + len);
             }
-            prev_end = static_cast<std::int64_t>(start + len);
         }
+    } else if (st.size() == 7) {
+        reader_t parents{st[0]};
+        reader_t runs{st[1]};
+        reader_t lengths{st[2]};
+        split_reader_t firsts{st[3], st[4]};
+        split_reader_t gaps{st[5], st[6]};
+        auto prev_end = static_cast<std::int64_t>(base);
+        while (!parents.done()) {
+            parent += parents.varint();
+            auto const num_runs = runs.varint() + 1;
+            for (std::uint64_t r = 0; r < num_runs; ++r) {
+                auto const start = static_cast<id_type>(
+                    r == 0 ? prev_end + firsts.sget()
+                           : prev_end + static_cast<std::int64_t>(gaps.get()));
+                auto const len = lengths.varint() + 1;
+                for (id_type k = 0; k < len; ++k) {
+                    result.emplace_back(start + k, parent);
+                }
+                prev_end = static_cast<std::int64_t>(start + len);
+            }
+        }
+    } else {
+        throw corrupt("index block");
     }
-    std::sort(result.begin(), result.end());
+    sort_by_member(&result);
     return result;
 }
 
